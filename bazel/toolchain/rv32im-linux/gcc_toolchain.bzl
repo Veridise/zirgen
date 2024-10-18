@@ -20,6 +20,7 @@ def gcc_toolchain_config(name, sysroot):
         "ld",
         "nm",
         "objdump",
+        "objcopy",
         "strip",
     ]}
 

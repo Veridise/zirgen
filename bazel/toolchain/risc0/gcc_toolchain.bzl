@@ -20,6 +20,7 @@ def gcc_toolchain_config(name, sysroot):
         "ld",
         "nm",
         "objdump",
+        "objcopy",
         "strip",
     ]}
     tool_paths["llvm-cov"] = "bin/riscv32-unknown-elf-gcov"
