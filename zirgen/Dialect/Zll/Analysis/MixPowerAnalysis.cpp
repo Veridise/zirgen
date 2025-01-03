@@ -14,6 +14,7 @@
 
 #include "zirgen/Dialect/Zll/Analysis/MixPowerAnalysis.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include <functional>
 
 using namespace mlir;
 using namespace zirgen::Zll;
@@ -29,7 +30,7 @@ MixPowAnalysis::MixPowAnalysis(Operation* funcOp) {
   assert(powsNeeded.empty());
   llvm::append_range(powsNeeded, llvm::make_second_range(mixPows));
   llvm::sort(powsNeeded);
-  powsNeeded.erase(llvm::unique(powsNeeded), powsNeeded.end());
+  powsNeeded.erase(llvm::unique(powsNeeded, std::equal_to<>{}), powsNeeded.end());
 
   auto indexed = llvm::map_range(llvm::enumerate(powsNeeded), [](auto elem) {
     auto [idx, pow] = elem;
