@@ -56,7 +56,7 @@ bool ComponentManager::isGeneric(StringRef name) {
 }
 
 struct ComponentManager::DebugListener : public OpBuilder::Listener {
-  void notifyOperationInserted(Operation* op, IRRewriter::InsertPoint previous) override {
+  void notifyOperationInserted(Operation* op /*, IRRewriter::InsertPoint previous*/) override {
     LLVM_DEBUG({
       llvm::dbgs() << "Generated: ";
       op->print(llvm::dbgs(), OpPrintingFlags().printGenericOpForm());
