@@ -14,67 +14,141 @@
 
 #[macro_use]
 pub mod codegen;
-
-pub mod cpu;
-
 mod buffers;
+
 pub use buffers::{BufferSpec, Buffers};
+use core::fmt::Debug;
+use risc0_core::{field::Elem, field::ExtElem};
+use risc0_zkp::{hal::cpu::SyncSlice, layout::Reg};
 
 /// This trait represents the set of registers available for a
 /// specific cycle.  For instance, this can either be a row in the
 /// execution trace or a set of global registers that are common to
 /// all cycles.
-pub trait BufferRow: Clone {
-    type ValType: Clone + Copy + Default;
-
-    fn load(&self, offset: usize, back: usize) -> Self::ValType;
-    fn store(&self, offset: usize, val: Self::ValType);
+#[derive(Clone, Copy)]
+pub struct BufferRow<'a, E: Default + Clone> {
+    pub buf: &'a SyncSlice<'a, E>,
+    kind: BufferKind,
 }
 
-impl<T: Clone + Copy + Default> BufferRow for &[T] {
-    type ValType = T;
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum BufferKind {
+    Global,
+    Cycle,
+}
 
-    fn load(&self, offset: usize, back: usize) -> T {
-        assert_eq!(back, 0, "Unexpected back when accessing a flat buffer");
-        self[offset]
+impl<'a, E: Default + Clone> Debug for BufferRow<'a, E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::result::Result<(), std::fmt::Error> {
+        write!(f, "BufferRow({:?})", self.kind)
     }
-    fn store(&self, _offset: usize, _val: Self::ValType) {
-        panic!("Attempt to write to read-only buffer")
+}
+
+impl<'a, E: Default + Clone> PartialEq for BufferRow<'a, E> {
+    fn eq(&self, rhs: &Self) -> bool {
+        self.kind == rhs.kind && ((self.buf as *const _) == (rhs.buf as *const _))
+    }
+}
+
+impl<'a, E: Elem> BufferRow<'a, E> {
+    pub fn global(buf: &'a SyncSlice<'a, E>) -> Self {
+        Self {
+            buf,
+            kind: BufferKind::Global,
+        }
+    }
+
+    pub fn cycle(buf: &'a SyncSlice<'a, E>) -> Self {
+        Self {
+            buf,
+            kind: BufferKind::Cycle,
+        }
+    }
+
+    pub fn load(&self, ctx: &impl CycleContext, offset: usize, back: usize) -> E {
+        match self.kind {
+            BufferKind::Global => {
+                assert_eq!(back, 0);
+                let val = self.buf.get(offset);
+                tracing::trace!("Load {val:?} from global offset {offset}");
+                debug_assert!(val.is_valid(), "Global offset {offset}");
+                val
+            }
+            BufferKind::Cycle => {
+                let adj_offset = ctx.offset_this_cycle(offset, back);
+                let val = self.buf.get(adj_offset);
+                tracing::trace!("Load {val:?} from offset {offset} back {back}");
+                val
+            }
+        }
+    }
+    pub fn store(&self, ctx: &impl CycleContext, offset: usize, val: E) {
+        match self.kind {
+            BufferKind::Global => {
+                if cfg!(debug_assertions) {
+                    let old_val = self.buf.get(offset);
+                    assert!(
+                        !old_val.is_valid() || old_val == val,
+                        "Global offset {offset}, Old value: {old_val:?}, New value: {val:?}"
+                    );
+                }
+                tracing::trace!("Store {val:?} to global offset {offset}");
+                self.buf.set(offset, val)
+            }
+            BufferKind::Cycle => {
+                if cfg!(debug_assertions) {
+                    let old_val = self.buf.get(ctx.offset_this_cycle(offset, 0));
+                    assert!(
+                        !old_val.is_valid() || old_val == val,
+                        "Old value: {old_val:?}, New value: {val:?}, offset: {offset}"
+                    );
+                }
+                tracing::trace!("Store {val:?} to offset {offset}");
+                self.buf.set(ctx.offset_this_cycle(offset, 0), val)
+            }
+        }
+    }
+}
+
+pub trait CycleContext {
+    fn cycle(&self) -> usize;
+    fn tot_cycles(&self) -> usize;
+
+    fn offset_this_cycle(&self, offset: usize, back: usize) -> usize {
+        let tot_cycles = self.tot_cycles();
+        let cycle = (self.cycle() + tot_cycles - back) % tot_cycles;
+        offset * tot_cycles + cycle
     }
 }
 
 /// This represents a layout bound to a buffer.
-pub struct BoundLayout<'a, L: 'static, B: BufferRow> {
+#[derive(PartialEq)]
+pub struct BoundLayout<'a, L: 'static, E: Elem> {
     pub layout: &'static L,
-    pub buf: &'a B,
+    pub buf: BufferRow<'a, E>,
 }
 
-// We can't derive these since derive(Copy) also puts bounds on BufferRow.
-impl<'a, L, B: BufferRow> Clone for BoundLayout<'a, L, B> {
+impl<'a, L: 'static, E: Elem> Copy for BoundLayout<'a, L, E> {}
+impl<'a, L: 'static, E: Elem> Clone for BoundLayout<'a, L, E> {
     fn clone(&self) -> Self {
-        BoundLayout {
-            buf: self.buf,
-            layout: self.layout,
-        }
-    }
-}
-impl<'a, L, B: BufferRow> Copy for BoundLayout<'a, L, B> {}
-
-impl<'a, L: PartialEq, B: BufferRow> PartialEq for BoundLayout<'a, L, B> {
-    fn eq(&self, other: &BoundLayout<L, B>) -> bool {
-        // We only need to compare the layout values
-        self.layout == other.layout
+        *self
     }
 }
 
-impl<'a, L, B: BufferRow> BoundLayout<'a, L, B> {
-    pub fn new(layout: &'static L, buf: &'a B) -> Self {
+impl<'a, L: risc0_zkp::layout::Component + 'static, E: Elem> Debug for BoundLayout<'a, L, E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::result::Result<(), std::fmt::Error> {
+        write!(f, "BoundLayout({}, {:?})", self.layout.ty_name(), self.buf)
+    }
+}
+
+impl<'a, L, E: Elem> BoundLayout<'a, L, E> {
+    pub fn new(layout: &'static L, buf: BufferRow<'a, E>) -> Self {
         Self { layout, buf }
     }
+
     pub fn map<NewL, F: FnOnce(&'static L) -> &'static NewL>(
         &self,
         f: F,
-    ) -> BoundLayout<'a, NewL, B> {
+    ) -> BoundLayout<'a, NewL, E> {
         BoundLayout {
             layout: f(self.layout),
             buf: self.buf,
@@ -84,46 +158,46 @@ impl<'a, L, B: BufferRow> BoundLayout<'a, L, B> {
     pub fn layout(&self) -> &'static L {
         self.layout
     }
-    pub fn buf(&self) -> &B {
-        &self.buf
+    pub fn buf(&self) -> BufferRow<E> {
+        self.buf
     }
 }
 
-// Takes the groups and globals provided in the
-// risc0_zkp::hal::CircuitHal::eval_check API and returns them with
-// names.
-//
-// Note that this order is different than the order required by poly_ext.
-//
-// TODO: This mapping should not be hardcoded.
-pub fn eval_check_named_buffers<'a, T: Copy>(
-    groups: &'a [T],
-    globals: &'a [T],
-) -> impl IntoIterator<Item = (&'static str, T)> + 'a {
-    const GROUP_NAMES: &[&'static str] = &["accum", "code", "data"];
-    const GLOBAL_NAMES: &[&'static str] = &["mix", "global"];
-    assert_eq!(GROUP_NAMES.len(), groups.len());
-    assert_eq!(GLOBAL_NAMES.len(), globals.len());
+impl<'a, E: Elem> BoundLayout<'a, Reg, E> {
+    pub fn load_ext<EE: ExtElem<SubElem = E>>(&self, ctx: &impl CycleContext, back: usize) -> EE {
+        let subelems =
+            (0..EE::EXT_SIZE).map(|idx| self.buf.load(ctx, self.layout.offset + idx, back));
 
-    GROUP_NAMES
-        .iter()
-        .copied()
-        .zip(groups.iter().copied())
-        .chain(GLOBAL_NAMES.iter().copied().zip(globals.iter().copied()))
+        if subelems.clone().any(|elem: EE::SubElem| !elem.is_valid()) {
+            EE::INVALID
+        } else {
+            EE::from_subelems(subelems)
+        }
+    }
+    pub fn load_unchecked_ext<EE: ExtElem<SubElem = E>>(
+        &self,
+        ctx: &impl CycleContext,
+        back: usize,
+    ) -> EE {
+        self.load_ext::<EE>(ctx, back).valid_or_zero()
+    }
+    pub fn store_ext<EE: ExtElem<SubElem = E>>(&self, ctx: &impl CycleContext, val: EE) {
+        for (idx, elem) in val.subelems().into_iter().enumerate() {
+            self.buf.store(ctx, self.layout.offset + idx, *elem)
+        }
+    }
 }
 
-// Takes the groups and globals provided to
-// the risc0_zkp::adapter::PolyExt::poly_ext API in the "args" parameter and returns
-// them with names.
-//
-// Note that this order is different than the order required by eval_check.
-//
-// TODO: This mapping should not be hardcoded.
-pub fn poly_ext_named_buffers<'a, T: Copy>(
-    args: &'a [T],
-) -> impl IntoIterator<Item = (&'static str, T)> + 'a {
-    const GLOBAL_NAMES: &[&'static str] = &["global", "mix"];
-    assert_eq!(GLOBAL_NAMES.len(), args.len());
+impl<'a, E: Elem + Clone + Default + Copy> BoundLayout<'a, Reg, E> {
+    pub fn load(&self, ctx: &impl CycleContext, back: usize) -> E {
+        self.buf.load(ctx, self.layout.offset, back)
+    }
 
-    GLOBAL_NAMES.iter().copied().zip(args.iter().copied())
+    pub fn load_unchecked(&self, ctx: &impl CycleContext, back: usize) -> E {
+        self.load(ctx, back).valid_or_zero()
+    }
+
+    pub fn store(&self, ctx: &impl CycleContext, val: E) {
+        self.buf.store(ctx, self.layout.offset, val);
+    }
 }

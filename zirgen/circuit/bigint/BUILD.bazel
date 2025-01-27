@@ -9,12 +9,12 @@ cc_library(
     name = "lib",
     srcs = [
         "elliptic_curve.cpp",
-        "op_tests.cpp",
+        "field.cpp",
         "rsa.cpp",
     ],
     hdrs = [
         "elliptic_curve.h",
-        "op_tests.h",
+        "field.h",
         "rsa.h",
         "//zirgen/circuit/recursion",
         "//zirgen/circuit/rv32im/v1/edsl:rv32im",
@@ -22,71 +22,138 @@ cc_library(
     deps = [
         "//zirgen/Dialect/BigInt/IR",
         "//zirgen/Dialect/BigInt/Transforms",
+        "//zirgen/Dialect/BigInt/Bytecode",
         "//zirgen/circuit/recursion:lib",
         "//zirgen/circuit/verify:lib",
         "//zirgen/compiler/edsl",
     ],
 )
 
-# TODO: It would be nice to split these into production vs test ZKRs
-ZKRS = [
-    "rsa_256_x1",
-    "rsa_256_x2",
-    "rsa_3072_x15",
-    "ec_add_rz8test",
-    "ec_add_secp256k1",
-    "ec_sub_rz8test",
-    "ec_sub_secp256k1",
-    "ec_doub_rz8test",
-    "ec_doub_secp256k1",
-    "ec_mul_rz8test",
-    "ec_mul_secp256k1",
-    "ec_neg_rz8test",
-    "ec_neg_secp256k1",
-    "ec_pts_eq_rz8test",
-    "ec_pts_eq_secp256k1",
-    "ec_on_curve_rz8test",
-    "ec_on_curve_secp256k1",
-    "ec_add_freely_rz8test",
-    "ec_sub_freely_rz8test",
-    "ec_doub_freely_rz8test",
-    "ec_neg_freely_rz8test",
-    "ec_mul_freely_rz8test",
-    "const_add_test_8",
-    "const_add_alt_test_16",
-    "const_mul_test_8",
-    "add_test_8",
-    "add_test_16",
-    "add_test_128",
-    "const_one_test_8",
-    "const_twobyte_test_16",
-    "sub_test_8",
-    "sub_test_128",
-    "mul_test_8",
-    "mul_test_128",
-    "reduce_test_8",
-    "reduce_test_128",
-    "nondet_inv_test_8",
-    # Perf tests, re-enable if needed
-    # "rep_ec_add_secp256k1_r5",
-    # "rep_ec_add_secp256k1_r10",
-    # "rep_ec_add_secp256k1_r256",
-    # "rep_ec_doub_secp256k1_r5",
-    # "rep_ec_doub_secp256k1_r10",
-    # "rep_ec_doub_secp256k1_r256",
+cc_binary(
+    name = "bibc-exec",
+    srcs = ["bibc-exec.cpp"],
+    deps = [
+        "//zirgen/Dialect/BigInt/IR",
+        "//zirgen/Dialect/BigInt/Bytecode",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:MlirOptLib",
+    ],
+)
+
+cc_binary(
+    name = "bigint2c",
+    srcs = ["bigint2c.cpp"],
+    deps = [
+        "//zirgen/circuit/bigint:lib",
+        "//zirgen/Dialect/BigInt/Bytecode",
+        "//zirgen/Dialect/BigInt/IR",
+        "//zirgen/Dialect/BigInt/Transforms",
+        "@llvm-project//llvm:Support",
+        "@llvm-project//mlir:MlirOptLib",
+    ],
+)
+
+BLOBS = [
+    "modpow65537_4096",
+    "ec_double_256",
+    "ec_add_256",
+    "extfield_deg2_add_256",
+    "extfield_deg2_mul_256",
+    "extfield_deg4_mul_256",
+    "extfield_deg2_sub_256",
+    "extfield_xxone_mul_256",
+    "modadd_256",
+    "modinv_256",
+    "modmul_256",
+    "modsub_256",
 ]
 
-build_circuit(
-    name = "gen_bigint",
-    srcs = ["gen_bigint.cpp"],
-    outs = [fn for zkr in ZKRS for fn in [
-        zkr + ".zkr",
-        zkr + ".zkr.dbg",
-    ]] + ["bigint.rs.inc"],
-    deps = [":lib"],
+genrule(
+    name = "modpow65537_4096",
+    outs = ["modpow65537_4096.blob"],
+    exec_tools = [":bigint2c"],
+    cmd = "$(location //zirgen/circuit/bigint:bigint2c) --program=modpow65537 --bitwidth 4096 > $(OUTS)"
+)
+
+genrule(
+    name = "ec_double_256",
+    outs = ["ec_double_256.blob"],
+    exec_tools = [":bigint2c"],
+    cmd = "$(location //zirgen/circuit/bigint:bigint2c) --program=ec_double --bitwidth 256 > $(OUTS)"
+)
+
+genrule(
+    name = "ec_add_256",
+    outs = ["ec_add_256.blob"],
+    exec_tools = [":bigint2c"],
+    cmd = "$(location //zirgen/circuit/bigint:bigint2c) --program=ec_add --bitwidth 256 > $(OUTS)"
+)
+
+genrule(
+    name = "extfield_deg2_add_256",
+    outs = ["extfield_deg2_add_256.blob"],
+    exec_tools = [":bigint2c"],
+    cmd = "$(location //zirgen/circuit/bigint:bigint2c) --program=extfield_deg2_add --bitwidth 256 > $(OUTS)"
+)
+
+genrule(
+    name = "extfield_deg4_mul_256",
+    outs = ["extfield_deg4_mul_256.blob"],
+    exec_tools = [":bigint2c"],
+    cmd = "$(location //zirgen/circuit/bigint:bigint2c) --program=extfield_deg4_mul --bitwidth 256 > $(OUTS)"
+)
+
+genrule(
+    name = "extfield_deg2_mul_256",
+    outs = ["extfield_deg2_mul_256.blob"],
+    exec_tools = [":bigint2c"],
+    cmd = "$(location //zirgen/circuit/bigint:bigint2c) --program=extfield_deg2_mul --bitwidth 256 > $(OUTS)"
+)
+
+genrule(
+    name = "extfield_deg2_sub_256",
+    outs = ["extfield_deg2_sub_256.blob"],
+    exec_tools = [":bigint2c"],
+    cmd = "$(location //zirgen/circuit/bigint:bigint2c) --program=extfield_deg2_sub --bitwidth 256 > $(OUTS)"
+)
+
+genrule(
+    name = "extfield_xxone_mul_256",
+    outs = ["extfield_xxone_mul_256.blob"],
+    exec_tools = [":bigint2c"],
+    cmd = "$(location //zirgen/circuit/bigint:bigint2c) --program=extfield_xxone_mul --bitwidth 256 > $(OUTS)"
+)
+
+genrule(
+    name = "modadd_256",
+    outs = ["modadd_256.blob"],
+    exec_tools = [":bigint2c"],
+    cmd = "$(location //zirgen/circuit/bigint:bigint2c) --program=modadd --bitwidth 256 > $(OUTS)"
+)
+
+genrule(
+    name = "modinv_256",
+    outs = ["modinv_256.blob"],
+    exec_tools = [":bigint2c"],
+    cmd = "$(location //zirgen/circuit/bigint:bigint2c) --program=modinv --bitwidth 256 > $(OUTS)"
+)
+
+genrule(
+    name = "modmul_256",
+    outs = ["modmul_256.blob"],
+    exec_tools = [":bigint2c"],
+    cmd = "$(location //zirgen/circuit/bigint:bigint2c) --program=modmul --bitwidth 256 > $(OUTS)"
+)
+
+genrule(
+    name = "modsub_256",
+    outs = ["modsub_256.blob"],
+    exec_tools = [":bigint2c"],
+    cmd = "$(location //zirgen/circuit/bigint:bigint2c) --program=modsub --bitwidth 256 > $(OUTS)"
 )
 
 pkg_zip(
-    name = "bigint_zkr",
-    srcs = [x + ".zkr" for x in ZKRS],
+    name = "bigint_blob",
+    srcs = [x + ".blob" for x in BLOBS],
 )
+

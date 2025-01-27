@@ -1,4 +1,4 @@
-// Copyright 2024 RISC Zero, Inc.
+// Copyright 2025 RISC Zero, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -36,21 +36,23 @@ llvm::hash_code hash_value(const FieldInfo& fi) {
 mlir::ParseResult parseFields(mlir::AsmParser& p, llvm::SmallVectorImpl<FieldInfo>& parameters) {
   return p.parseCommaSeparatedList(
       mlir::AsmParser::Delimiter::LessGreater, [&]() -> mlir::ParseResult {
+        bool isPrivate = false;
         std::string name;
         if (p.parseKeywordOrString(&name) || p.parseColon()) {
           return mlir::failure();
         }
-        StorageKind storage = StorageKind::Normal;
-        if (succeeded(p.parseOptionalKeyword("reserve"))) {
-          storage = StorageKind::Reserve;
-        } else if (succeeded(p.parseOptionalKeyword("use"))) {
-          storage = StorageKind::Use;
+        if (name == "private") {
+          isPrivate = true;
+          if (p.parseKeywordOrString(&name) || p.parseColon()) {
+            return mlir::failure();
+          }
         }
         mlir::Type type;
         if (p.parseType(type)) {
           return mlir::failure();
         }
-        parameters.push_back(FieldInfo{mlir::StringAttr::get(p.getContext(), name), type, storage});
+        parameters.push_back(
+            FieldInfo{mlir::StringAttr::get(p.getContext(), name), type, isPrivate});
         return mlir::success();
       });
 }
@@ -58,18 +60,12 @@ mlir::ParseResult parseFields(mlir::AsmParser& p, llvm::SmallVectorImpl<FieldInf
 void printFields(mlir::AsmPrinter& p, llvm::ArrayRef<FieldInfo> fields) {
   p << '<';
   llvm::interleaveComma(fields, p, [&](const FieldInfo& field) {
+    if (field.isPrivate) {
+      p.printKeywordOrString("private");
+      p << " ";
+    }
     p.printKeywordOrString(field.name.getValue());
     p << ": ";
-    switch (field.storage) {
-    case StorageKind::Normal:
-      break;
-    case StorageKind::Reserve:
-      p << "reserve ";
-      break;
-    case StorageKind::Use:
-      p << "use ";
-      break;
-    }
     p << field.type;
   });
   p << ">";
@@ -190,9 +186,16 @@ bool isRecordType(mlir::Type container) {
           if (t.getId() == "NondetReg") {
             // Regs can contain a "@wrapped" referring to a register, which is otherwise disallowed.
             return mlir::WalkResult::skip();
-          } else {
-            return mlir::WalkResult::advance();
           }
+
+          for (auto field : t.getFields()) {
+            if (field.name == "@layout")
+              continue;
+            if (!isRecordType(field.type))
+              return mlir::WalkResult::interrupt();
+          }
+
+          return mlir::WalkResult::skip();
         })
         .Default([&](auto) { return mlir::WalkResult::interrupt(); });
   });
@@ -243,10 +246,6 @@ CodegenIdent<IdentKind::Type>
 LayoutArrayType::getTypeName(zirgen::codegen::CodegenEmitter& cg) const {
   auto elemName = cg.getTypeName(getElement());
   return cg.getStringAttr((elemName.strref() + std::to_string(getSize()) + "LayoutArray").str());
-}
-
-Value LayoutArrayType::materialize(Location loc, ArrayRef<Value> elements, OpBuilder& builder) {
-  return builder.create<LayoutArrayOp>(loc, elements);
 }
 
 CodegenIdent<IdentKind::Type> LayoutType::getTypeName(zirgen::codegen::CodegenEmitter& cg) const {
@@ -307,6 +306,20 @@ LogicalResult LayoutType::verify(function_ref<InFlightDiagnostic()> emitError,
       return emitError() << "invalid field type in layout: " << field.type;
   }
 
+  return success();
+}
+
+LogicalResult LayoutArrayType::verify(function_ref<InFlightDiagnostic()> emitError,
+                                      mlir::Type element,
+                                      unsigned size) {
+  if (!size)
+    return emitError() << "Layout arrays may not be empty";
+  return success();
+}
+LogicalResult
+ArrayType::verify(function_ref<InFlightDiagnostic()> emitError, mlir::Type element, unsigned size) {
+  if (!size)
+    return emitError() << "Arrays may not be empty";
   return success();
 }
 

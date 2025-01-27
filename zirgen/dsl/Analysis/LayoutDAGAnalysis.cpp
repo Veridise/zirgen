@@ -168,17 +168,17 @@ LayoutDAG::Ptr LayoutDAG::clone(Ptr layout) {
 
 // LayoutDAGAnalysis
 
-void LayoutDAGAnalysis::visitOperation(Operation* op) {
-  TypeSwitch<Operation*>(op)
-      .Case<AliasLayoutOp, LookupOp, SubscriptOp, LayoutArrayOp, CheckLayoutFuncOp>(
-          [&](auto op) { visitOp(op); });
+LogicalResult LayoutDAGAnalysis::visitOperation(Operation* op) {
+  TypeSwitch<Operation*>(op).Case<AliasLayoutOp, LookupOp, SubscriptOp, CheckLayoutFuncOp>(
+      [&](auto op) { visitOp(op); });
+  return success();
 }
 
 void LayoutDAGAnalysis::visitOp(AliasLayoutOp op) {
   // AliasLayoutOp has no results, so we need to add an explicit dependence on
   // op so that we revisit once lhs and rhs both have their lattice points
-  const auto& lhs = getOrCreateFor<Element>(op, op.getLhs())->getValue();
-  const auto& rhs = getOrCreateFor<Element>(op, op.getRhs())->getValue();
+  const auto& lhs = getOrCreateFor<Element>(getProgramPointAfter(op), op.getLhs())->getValue();
+  const auto& rhs = getOrCreateFor<Element>(getProgramPointAfter(op), op.getRhs())->getValue();
   if (lhs.isDefined() && rhs.isDefined()) {
     assert(succeeded(LayoutDAG::unify(lhs.get(), rhs.get())));
   } else {
@@ -191,7 +191,7 @@ void LayoutDAGAnalysis::visitOp(AliasLayoutOp op) {
 void LayoutDAGAnalysis::visitOp(LookupOp op) {
   // [[ base.member ]] := [[ base ]].member
   if (isa<LayoutType>(op.getBase().getType())) {
-    const auto* baseLayout = getOrCreateFor<Element>(op.getOut(), op.getBase());
+    const auto* baseLayout = getOrCreateFor<Element>(getProgramPointAfter(op), op.getBase());
     if (baseLayout->getValue().isDefined()) {
       LayoutDAG::Ptr sublayout = baseLayout->getValue().get()->lookup(op.getMemberAttr());
       auto* lattice = getOrCreate<Element>(op.getOut());
@@ -203,9 +203,9 @@ void LayoutDAGAnalysis::visitOp(LookupOp op) {
 void LayoutDAGAnalysis::visitOp(SubscriptOp op) {
   // [[ base[index] ]] := [[ layout(base) ]][index]
   if (isa<LayoutArrayType>(op.getBase().getType())) {
-    const auto* baseLayout = getOrCreateFor<Element>(op.getOut(), op.getBase());
+    const auto* baseLayout = getOrCreateFor<Element>(getProgramPointAfter(op), op.getBase());
     ConstantValue indexValue =
-        getOrCreateFor<Lattice<ConstantValue>>(op.getOut(), op.getIndex())->getValue();
+        getOrCreateFor<Lattice<ConstantValue>>(getProgramPointAfter(op), op.getIndex())->getValue();
     if (baseLayout->getValue().isDefined() && !indexValue.isUninitialized()) {
       Attribute indexAttr = indexValue.getConstantValue();
       if (!indexAttr)
@@ -216,20 +216,6 @@ void LayoutDAGAnalysis::visitOp(SubscriptOp op) {
       propagateIfChanged(lattice, lattice->join(sublayout));
     }
   }
-}
-
-void LayoutDAGAnalysis::visitOp(LayoutArrayOp op) {
-  // [[ [a, ..., z] ]] := [[[ a ]], ..., [[ z ]]]
-  SmallVector<LayoutDAG::Ptr> elements;
-  for (Value element : op.getElements()) {
-    auto subLattice = getOrCreateFor<Element>(op.getOut(), element)->getValue();
-    if (!subLattice.isDefined())
-      return;
-    elements.push_back(subLattice.get());
-  }
-  auto updated = std::make_shared<LayoutDAG>(AbstractArray{op.getResult().getType(), elements});
-  auto* lattice = getOrCreate<Element>(op.getOut());
-  propagateIfChanged(lattice, lattice->join(updated));
 }
 
 void LayoutDAGAnalysis::visitOp(CheckLayoutFuncOp op) {

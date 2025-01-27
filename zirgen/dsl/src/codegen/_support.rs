@@ -16,10 +16,11 @@
 
 use std::array::from_fn;
 
-use crate::{BoundLayout, BufferRow};
-use anyhow::Result;
+use crate::{BoundLayout, BufferRow, CycleContext};
+use anyhow::{anyhow, Result};
 use risc0_core::field::{Elem, ExtElem, Field};
 use risc0_zkp::adapter::MixState;
+use std::backtrace::Backtrace;
 
 pub type Index = usize;
 pub type TapGroupName = &'static str;
@@ -61,10 +62,10 @@ where
     })
 }
 
-pub fn layout_map<B: BufferRow, Layout, NewLayout>(
-    layout: BoundLayout<Layout, B>,
+pub fn layout_map<E: Elem, Layout, NewLayout>(
+    layout: BoundLayout<Layout, E>,
     f: impl Fn(&'static Layout) -> &'static NewLayout,
-) -> BoundLayout<NewLayout, B>
+) -> BoundLayout<NewLayout, E>
 where
 {
     layout.map(f)
@@ -74,7 +75,7 @@ pub fn eqz(v: impl Elem) -> Result<()> {
     if v.to_u32_words().into_iter().all(|v| v == 0) {
         Ok(())
     } else {
-        anyhow::bail!("Eqz failed: {:?}", v)
+        Err(anyhow!("Eqz failed: {:?}", v).context(Backtrace::force_capture()))
     }
 }
 
@@ -106,15 +107,14 @@ where
         })
 }
 
-pub fn map_layout<T, Layout, U, F, RowType, const N: usize>(
+pub fn map_layout<'a, T, Layout, U, F, E: Elem, const N: usize>(
     arr: [T; N],
-    layouts: BoundLayout<[&'static Layout; N], RowType>,
+    layouts: BoundLayout<'a, [&'static Layout; N], E>,
     mut f: F,
 ) -> Result<[U; N]>
 where
     T: Copy,
-    F: FnMut(T, BoundLayout<Layout, RowType>) -> Result<U>,
-    RowType: BufferRow,
+    F: FnMut(T, BoundLayout<'a, Layout, E>) -> Result<U>,
 {
     // Unfortunately, we have to convert from an Array to an Iterator to collect
     // the sequence of results into a result of a sequence. When we convert back,
@@ -145,16 +145,15 @@ where
     Ok(output)
 }
 
-pub fn reduce_layout<T, Layout, U, F, RowType, const N: usize>(
+pub fn reduce_layout<T, Layout, U, F, E: Elem, const N: usize>(
     arr: [T; N],
     init: U,
-    layouts: BoundLayout<[&'static Layout; N], RowType>,
+    layouts: BoundLayout<[&'static Layout; N], E>,
     mut f: F,
 ) -> Result<U>
 where
     T: Copy,
-    F: FnMut(U, T, BoundLayout<Layout, RowType>) -> Result<U>,
-    RowType: BufferRow,
+    F: FnMut(U, T, BoundLayout<Layout, E>) -> Result<U>,
 {
     let mut output = init;
     for (element, layout) in arr.iter().zip(layouts.layout().iter()) {
@@ -167,8 +166,14 @@ where
     Ok(output)
 }
 
-pub fn is_nonzero(val: impl Elem) -> bool {
-    val.to_u32_words().into_iter().any(|v| v != 0)
+pub fn is_true(val: impl Elem) -> bool {
+    if val == Elem::ZERO {
+        false
+    } else if val == Elem::ONE {
+        true
+    } else {
+        panic!("Expected one or zero, got {val:?}");
+    }
 }
 
 pub fn inv<E: Elem>(v: E) -> Result<E> {
@@ -197,8 +202,71 @@ pub fn in_range<E: Elem + Into<u32>>(low: E, mid: E, high: E) -> Result<E> {
     }
 }
 
-pub fn get<E: Elem>(buf: &impl BufferRow<ValType = E>, offset: usize, _: usize) -> Result<E> {
-    Ok(buf.load(offset, 0))
+// Usizable is used for indexing into arrays, since we sometimes get an i32 and sometimes get an element.
+// TODO: refactor so we don't need this.
+pub trait Usizable {
+    fn as_usize(&self) -> usize;
+}
+
+impl Usizable for risc0_core::field::baby_bear::BabyBearElem {
+    fn as_usize(&self) -> usize {
+        u32::from(*self) as usize
+    }
+}
+
+impl Usizable for usize {
+    fn as_usize(&self) -> usize {
+        *self
+    }
+}
+
+impl Usizable for i32 {
+    fn as_usize(&self) -> usize {
+        *self as usize
+    }
+}
+
+pub fn to_usize<E: Usizable>(elem: E) -> usize {
+    elem.as_usize()
+}
+
+pub fn get<E: Elem>(
+    ctx: &impl CycleContext,
+    buf: BufferRow<E>,
+    offset: usize,
+    back: usize,
+) -> Result<E> {
+    Ok(buf.load(ctx, offset, back))
+}
+
+pub fn set<E: Elem>(
+    ctx: &impl CycleContext,
+    buf: BufferRow<E>,
+    offset: usize,
+    val: E,
+) -> Result<()> {
+    buf.store(ctx, offset, val);
+    Ok(())
+}
+
+// Stub cycle context to use for when we know we're only going to be accessing globals
+struct GlobalCycleContext;
+impl CycleContext for GlobalCycleContext {
+    fn cycle(&self) -> usize {
+        unreachable!()
+    }
+    fn tot_cycles(&self) -> usize {
+        unreachable!()
+    }
+}
+
+pub fn get_global<E: Elem>(buf: BufferRow<E>, offset: usize) -> Result<E> {
+    Ok(buf.load(&GlobalCycleContext, offset, 0))
+}
+
+pub fn set_global<E: Elem>(buf: BufferRow<E>, offset: usize, val: E) -> Result<()> {
+    buf.store(&GlobalCycleContext, offset, val);
+    Ok(())
 }
 
 // Locally import all the codegen_* macros without the codegen_ prefix.

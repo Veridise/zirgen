@@ -1,6 +1,8 @@
 DEFAULT_OUTS = [
     "eval_check.cu",
+    "eval_check.cuh",
     "eval_check.metal",
+    "eval_check.h",
     "impl.h",
     "info.rs",
     "poly_edsl.cpp",
@@ -29,19 +31,19 @@ DEFAULT_OUTS = [
 ]
 
 ZIRGEN_OUTS = [
-    "circuit.ir",
-    "types.h.inc",
-    "types.rs.inc",
     "defs.cpp.inc",
+    "defs.cu.inc",
     "defs.rs.inc",
+    "info.rs",
     "layout.cpp.inc",
+    "layout.cu.inc",
     "layout.rs.inc",
-    "steps.cpp.inc",
-    "steps.rs.inc",
-    "validity_regs.cpp.inc",
-    "validity_regs.rs.inc",
-    "validity_taps.cpp.inc",
-    "validity_taps.rs.inc",
+    "poly_ext.rs",
+    "taps.rs",
+    "types.h.inc",
+    "types.cuh.inc",
+    "types.rs.inc",
+    "validity.ir",
 ]
 
 def _impl(ctx):
@@ -59,7 +61,7 @@ def _impl(ctx):
     ctx.actions.run(
         mnemonic = "CodegenCircuits",
         executable = ctx.executable.binary,
-        arguments = ctx.attr.extra_args + ["--output-dir", dirname],
+        arguments = [ctx.expand_location(arg, targets = ctx.attr.data) for arg in ctx.attr.extra_args] + ["--output-dir", dirname],
         inputs = ctx.files.data,
         outputs = outs,
         tools = [ctx.executable.binary],
@@ -95,15 +97,15 @@ def build_circuit(name, srcs = [], bin = None, deps = [], outs = None, data = []
             name = bin,
             srcs = srcs,
             deps = deps + [
-                "//zirgen/compiler/edsl",
-                "//zirgen/compiler/codegen",
+                "@zirgen//zirgen/compiler/edsl",
+                "@zirgen//zirgen/compiler/codegen",
             ],
         )
 
     _build_circuit_rule(
         name = name,
         binary = bin,
-        data = ["//zirgen/compiler/codegen:data"] + data,
+        data = ["@zirgen//zirgen/compiler/codegen:data"] + data,
         outs = outs,
         extra_args = extra_args,
     )

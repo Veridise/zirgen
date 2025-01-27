@@ -33,27 +33,27 @@ namespace codegen {
 namespace {
 
 void addCommonSyntax(CodegenOptions& opts) {
-  opts.addLiteralHandler<IntegerAttr>(
-      [](CodegenEmitter& cg, auto intAttr) { cg << intAttr.getValue().getZExtValue(); });
-  opts.addLiteralHandler<StringAttr>(
+  opts.addLiteralSyntax<StringAttr>(
       [](CodegenEmitter& cg, auto strAttr) { cg.emitEscapedString(strAttr); });
+  opts.addLiteralSyntax<IntegerAttr>(
+      [](CodegenEmitter& cg, auto intAttr) { cg << intAttr.getValue().getZExtValue(); });
 }
 
 void addCppSyntax(CodegenOptions& opts) {
-  opts.addLiteralHandler<PolynomialAttr>([&](CodegenEmitter& cg, auto polyAttr) {
+  opts.addLiteralSyntax<PolynomialAttr>([&](CodegenEmitter& cg, auto polyAttr) {
     auto elems = polyAttr.asArrayRef();
     if (elems.size() == 1) {
       cg << "Val(" << elems[0] << ")";
-    } else {
-      cg << "Val" << elems.size() << "{";
+    } else if (elems.size() == 4) {
+      cg << "ExtVal(";
       cg.interleaveComma(elems);
-      cg << "}";
+      cg << ")";
     }
   });
 }
 
 void addRustSyntax(CodegenOptions& opts) {
-  opts.addLiteralHandler<PolynomialAttr>([&](CodegenEmitter& cg, auto polyAttr) {
+  opts.addLiteralSyntax<PolynomialAttr>([&](CodegenEmitter& cg, auto polyAttr) {
     auto elems = polyAttr.asArrayRef();
     if (elems.size() == 1) {
       cg << "Val::new(" << elems[0] << ")";
@@ -93,6 +93,7 @@ CodegenOptions getCudaCodegenOpts() {
   addCommonSyntax(opts);
   addCppSyntax(opts);
   ZStruct::addCppSyntax(opts);
+  Zhlt::addCppSyntax(opts);
   return opts;
 }
 
@@ -136,26 +137,26 @@ void optimizePoly(ModuleOp module, const EmitCodeOptions& opts) {
   }
 }
 
-struct CodegenCLOptions {
-  cl::opt<std::string> outputDir{
-      "output-dir", cl::desc("Output directory"), cl::value_desc("dir"), cl::Required};
-};
-
-static llvm::ManagedStatic<CodegenCLOptions> clOptions;
-
 llvm::StringRef getOutputDir() {
-  if (!clOptions.isConstructed()) {
+  if (!codegenCLOptions.isConstructed()) {
     throw(std::runtime_error("codegen command line options must be registered"));
   }
 
-  return clOptions->outputDir;
+  return codegenCLOptions->outputDir;
 }
 
 } // namespace
 
+llvm::ManagedStatic<CodegenCLOptions> codegenCLOptions;
+
 class FileEmitter {
 public:
   FileEmitter(StringRef path) : path(path) {}
+
+  void emitIR(const std::string& fn, Operation* op) {
+    auto ofs = openOutputFile(fn + ".ir");
+    op->print(*ofs.get());
+  }
 
   void emitRustStep(const std::string& stage, func::FuncOp func) {
     auto ofs = openOutputFile("rust_step_" + stage + ".cpp");
@@ -168,8 +169,16 @@ public:
   }
 
   void emitPolyFunc(const std::string& fn, func::FuncOp func) {
-    auto ofs = openOutputFile("rust_" + fn + ".cpp");
-    createRustStreamEmitter(*ofs)->emitPolyFunc(fn, func);
+    if (codegenCLOptions->validitySplitCount > 1) {
+      for (size_t i : llvm::seq(size_t(codegenCLOptions->validitySplitCount))) {
+        auto ofs = openOutputFile("rust_" + fn + "_" + std::to_string(i) + ".cpp");
+        createRustStreamEmitter(*ofs)->emitPolyFunc(
+            fn, func, i, size_t(codegenCLOptions->validitySplitCount));
+      }
+    } else {
+      auto ofs = openOutputFile("rust_" + fn + ".cpp");
+      createRustStreamEmitter(*ofs)->emitPolyFunc(fn, func, /*split part=*/0, /*num splits=*/1);
+    }
   }
 
   void emitPolyEdslFunc(func::FuncOp func) {
@@ -202,9 +211,21 @@ public:
     createCppStreamEmitter(*ofs)->emitHeader(func);
   }
 
-  void emitEvalCheck(const std::string& suffix, func::FuncOp func) {
-    auto ofs = openOutputFile("eval_check" + suffix);
-    createGpuStreamEmitter(*ofs, suffix)->emitPoly(func);
+  void
+  emitEvalCheck(const std::string& suffix, const std::string& headerSuffix, func::FuncOp func) {
+    if (codegenCLOptions->validitySplitCount > 1) {
+      for (size_t i : llvm::seq(size_t(codegenCLOptions->validitySplitCount))) {
+        auto ofs = openOutputFile("eval_check_" + std::to_string(i) + suffix);
+        createGpuStreamEmitter(*ofs, suffix)
+            ->emitPoly(func, i, size_t(codegenCLOptions->validitySplitCount));
+      }
+    } else {
+      auto ofs = openOutputFile("eval_check" + suffix);
+      createGpuStreamEmitter(*ofs, suffix)->emitPoly(func, /*split part=*/0, /*num splits=*/1);
+    }
+
+    auto ofs = openOutputFile("eval_check" + headerSuffix);
+    createGpuStreamEmitter(*ofs, suffix)->emitPoly(func, 0, 0, /*declsOnly=*/true);
   }
 
   void emitAllLayouts(mlir::ModuleOp op) {
@@ -237,7 +258,7 @@ private:
 };
 
 void registerCodegenCLOptions() {
-  *clOptions;
+  *codegenCLOptions;
 }
 
 void emitCode(ModuleOp module, const EmitCodeOptions& opts) {
@@ -284,11 +305,51 @@ void emitCode(ModuleOp module, const EmitCodeOptions& opts) {
     emitter.emitPolyExtFunc(func);
     emitter.emitTaps(func);
     emitter.emitInfo(func);
-    emitter.emitEvalCheck(".cu", func);
-    emitter.emitEvalCheck(".metal", func);
+    emitter.emitEvalCheck(".cu", ".cuh", func);
+    emitter.emitEvalCheck(".metal", ".h", func);
     emitter.emitPolyEdslFunc(func);
     emitter.emitHeader(func);
     emitter.emitTapsCpp(func);
+  });
+}
+
+void emitCodeZirgenPoly(ModuleOp module, StringRef outputDir) {
+  FileEmitter emitter(outputDir);
+
+  // Inline everything, since everything else expects there to be a single function left.
+  PassManager pm(module.getContext());
+  pm.addPass(mlir::createInlinerPass());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
+  if (failed(pm.run(module))) {
+    throw std::runtime_error("Failed to apply stage1 passes");
+  }
+
+  // Save as IR so we can generate predicates to verify the validity polynomial.
+  emitter.emitIR("validity", module);
+
+  module.walk([&](func::FuncOp func) {
+    emitter.emitPolyExtFunc(func);
+    emitter.emitTaps(func);
+    emitter.emitInfo(func);
+    emitter.emitTapsCpp(func);
+  });
+
+  // Split up functions for poly_fp
+  pm.clear();
+  pm.addPass(Zll::createBalancedSplitPass(/*maxOps=*/1000));
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
+  if (failed(pm.run(module))) {
+    throw std::runtime_error("Failed to balanced split");
+  }
+
+  module.walk([&](func::FuncOp func) {
+    if (SymbolTable::getSymbolVisibility(func) == SymbolTable::Visibility::Private)
+      return;
+
+    emitter.emitPolyFunc("poly_fp", func);
+    emitter.emitEvalCheck(".cu", ".cuh", func);
   });
 }
 

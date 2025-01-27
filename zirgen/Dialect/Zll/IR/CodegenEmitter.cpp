@@ -36,7 +36,7 @@ namespace cl = llvm::cl;
 static cl::opt<size_t> inlineDepth("codegen-inline-depth",
                                    cl::desc("Maximum depth of generated calls to inline instead of "
                                             "assigning to a variable for readability"),
-                                   cl::init(5));
+                                   cl::init(2));
 
 namespace zirgen::codegen {
 
@@ -59,7 +59,32 @@ void CodegenEmitter::emitTopLevel(Operation* op) {
       .Default([&](auto op) { emitStatement(op); });
 }
 
-std::string CodegenEmitter::canonIdent(llvm::StringRef ident, IdentKind idt) {
+void CodegenEmitter::emitTopLevelDecl(Operation* op) {
+  if (op->hasTrait<CodegenSkipTrait>())
+    return;
+
+  TypeSwitch<Operation*>(op)
+      .Case<FunctionOpInterface>([&](FunctionOpInterface op) { emitFuncDecl(op); })
+      .Case<CodegenGlobalOpInterface>(
+          [&](CodegenGlobalOpInterface op) { op.emitGlobalDecl(*this); })
+      .Default([&](auto op) {
+        llvm::errs() << "Unable to emit declaration for " << op << "\n";
+        abort();
+      });
+}
+
+StringAttr CodegenEmitter::canonIdent(llvm::StringRef ident, IdentKind idt) {
+  return canonIdent(StringAttr::get(ctx, ident), idt);
+}
+
+StringAttr CodegenEmitter::canonIdent(StringAttr identAttr, IdentKind idt) {
+
+  auto& existing = canonIdents[std::make_pair(identAttr, idt)];
+  if (existing) {
+    return existing;
+  }
+
+  StringRef ident = identAttr.strref();
   assert(!ident.empty());
 
   std::string id;
@@ -79,11 +104,61 @@ std::string CodegenEmitter::canonIdent(llvm::StringRef ident, IdentKind idt) {
     }
   }
   // Apply language-specific canonicalization.
-  return opts.lang->canonIdent(id, idt);
+  std::string canonStr = opts.lang->canonIdent(id, idt);
+  auto canon = StringAttr::get(ctx, opts.lang->canonIdent(id, idt));
+
+  size_t unique_index = 0;
+  while (identsUsed.contains(canon)) {
+    canon = StringAttr::get(ctx, canonStr + "_" + std::to_string(unique_index++));
+  }
+
+  existing = canon;
+  identsUsed.insert(canon);
+  return canon;
 }
 
 void CodegenEmitter::resetValueNumbering() {
   nextVarId = 0;
+}
+
+void CodegenEmitter::emitFuncDecl(FunctionOpInterface op) {
+  if (op->hasTrait<OpTrait::IsIsolatedFromAbove>()) {
+    resetValueNumbering();
+  }
+  auto body = op.getCallableRegion();
+  llvm::ArrayRef<std::string> contextArgs;
+  if (opts.funcContextArgs.contains(op->getName().getStringRef())) {
+    contextArgs = opts.funcContextArgs.at(op->getName().getStringRef());
+  }
+
+  // Pick up any special names of arguments.
+  DenseMap<Value, StringRef> argValueNames;
+  if (auto opAsm = dyn_cast<OpAsmOpInterface>(op.getOperation())) {
+    opAsm.getAsmBlockArgumentNames(*body,
+                                   [&](Value v, StringRef name) { argValueNames[v] = name; });
+  }
+
+  llvm::SmallVector<CodegenIdent<IdentKind::Var>> argNames;
+  for (auto [argNum, arg] : llvm::enumerate(op.getArguments())) {
+    StringRef baseName;
+    if (auto argNameAttr = op.getArgAttrOfType<StringAttr>(argNum, "zirgen.argName"))
+      baseName = argNameAttr;
+    if (baseName.empty())
+      baseName = argValueNames.lookup(arg);
+    if (baseName.empty())
+      baseName = "arg";
+    argNames.push_back(getStringAttr((baseName + std::to_string(argNum)).str()));
+  }
+
+  opts.lang->emitFuncDeclaration(*this,
+                                 op.getNameAttr(),
+                                 contextArgs,
+                                 argNames,
+                                 llvm::cast<FunctionType>(op.getFunctionType()));
+
+  if (op->hasTrait<OpTrait::IsIsolatedFromAbove>()) {
+    resetValueNumbering();
+  }
 }
 
 void CodegenEmitter::emitFunc(FunctionOpInterface op) {
@@ -215,6 +290,10 @@ void getCallStack(SmallVector<Location>& calls, Location loc) {
     calls.push_back(NameLoc::get(nameLoc.getName(), stripColumn(nameLoc.getChildLoc())));
   } else if (llvm::isa<FileLineColLoc>(loc)) {
     calls.push_back(stripColumn(loc));
+  } else if (llvm::isa<FusedLoc>(loc)) {
+    for (Location subLoc : llvm::cast<FusedLoc>(loc).getLocations()) {
+      getCallStack(calls, subLoc);
+    }
   } else if (!llvm::isa<UnknownLoc>(loc)) {
     llvm::errs() << "UNKNOWN location " << loc << "\n";
     calls.push_back(loc);
@@ -281,7 +360,7 @@ void CodegenEmitter::emitValue(CodegenValue val) {
     // If this comes from a mlir::Value, either reference the
     // previously emitted operation or emit it inline.
     if (varNames.contains(val.value)) {
-      VarInfo& varInfo = varNames.getOrInsertDefault(val.value);
+      VarInfo& varInfo = varNames[val.value];
 
       if (varInfo.usesRemaining) {
         varInfo.usesRemaining--;
@@ -333,6 +412,10 @@ CodegenEmitter::getNewValueName(mlir::Value val, llvm::StringRef namePrefix, boo
 }
 
 void CodegenEmitter::emitExpr(Operation* op) {
+  if (auto f = opts.opSyntax.lookup(op->getName().getStringRef())) {
+    f(*this, op);
+    return;
+  }
   if (auto codegenOp = dyn_cast<CodegenExprOpInterface>(op)) {
     codegenOp.emitExpr(*this);
     return;
@@ -366,7 +449,7 @@ void CodegenEmitter::emitExpr(Operation* op) {
     }
   }
 
-  // If all else fails and we have no internal reigons, emit as a function call.
+  // If all else fails and we have no internal regions, emit as a function call.
   if (op->getRegions().empty()) {
     opts.lang->emitCall(*this,
                         getStringAttr(op->getName().stripDialect()),
@@ -380,7 +463,7 @@ void CodegenEmitter::emitExpr(Operation* op) {
 }
 
 void CodegenEmitter::emitLiteral(mlir::Type ty, mlir::Attribute value) {
-  if (auto f = opts.literalHandlers.lookup(value.getAbstractAttribute().getName())) {
+  if (auto f = opts.literalSyntax.lookup(value.getAbstractAttribute().getName())) {
     f(*this, value);
     return;
   }
@@ -395,6 +478,10 @@ void CodegenEmitter::emitLiteral(mlir::Type ty, mlir::Attribute value) {
 
 void CodegenEmitter::emitConstDef(CodegenIdent<IdentKind::Const> name, CodegenValue value) {
   opts.lang->emitSaveConst(*this, name, value);
+}
+
+void CodegenEmitter::emitConstDecl(CodegenIdent<IdentKind::Const> name, Type type) {
+  opts.lang->emitConstDecl(*this, name, type);
 }
 
 void CodegenEmitter::emitConditional(CodegenValue condition, mlir::Region& region) {

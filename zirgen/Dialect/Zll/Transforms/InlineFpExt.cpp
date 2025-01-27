@@ -266,7 +266,7 @@ struct Rewriter {
       TypeSwitch<Operation*>(&origOp)
           .Case<NegOp>([&](auto op) { doUnaryEltwise(op); })
           .Case<AddOp, SubOp>([&](auto op) { doBinaryEltwise(op, true); })
-          .Case<BitAndOp>([&](auto op) { doBinaryEltwise(op, false); })
+          .Case<BitAndOp, ModOp>([&](auto op) { doBinaryEltwise(op, false); })
           .Case<Iop::ReadOp>([&](auto op) { doIopRead(op); })
           .Case<Iop::RngValOp>([&](auto op) { doIopRngVal(op); })
           .Case<HashOp>([&](auto op) { doHash(op); })
@@ -276,6 +276,11 @@ struct Rewriter {
           .Case<InvOp>([&](auto op) { doInv(op); })
           .Case<MulOp>([&](auto op) { doMul(op); })
           .Case<NormalizeOp>([&](auto op) { doUnaryEltwise(op); })
+          .Case<ExternOp>([&](auto op) {
+            if (op.getName() != "log") {
+              op->emitWarning() << "Warning: discarding non-log extern";
+            }
+          })
           .Case<HashFoldOp,
                 HashAssertEqOp,
                 Iop::CommitOp,

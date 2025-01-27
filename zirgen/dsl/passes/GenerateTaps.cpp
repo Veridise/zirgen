@@ -42,6 +42,9 @@ struct GenerateTapsPass : public GenerateTapsBase<GenerateTapsPass> {
 
     DenseMap<std::pair</*buffer=*/StringAttr, /*offset=*/size_t>, /*backs=*/DenseSet<size_t>>
         namedTaps;
+    DenseMap<std::tuple</*buffer=*/StringAttr, /*offset=*/size_t, /*back=*/size_t>,
+             SmallVector<Zll::GetOp>>
+        getOps;
 
     auto walkResult = module.walk([&](Zhlt::CheckFuncOp check) {
       Zll::Interpreter interp(ctx);
@@ -64,6 +67,20 @@ struct GenerateTapsPass : public GenerateTapsBase<GenerateTapsPass> {
       });
       if (res.wasInterrupted())
         return WalkResult::interrupt();
+
+      res = check->walk([&](Zll::GetOp op) {
+        auto bufOp = op.getBuf().getDefiningOp<GetBufferOp>();
+        if (!bufOp) {
+          op->emitError() << "unable to determine buffer";
+          return WalkResult::interrupt();
+        }
+
+        namedTaps[std::make_pair(bufOp.getNameAttr(), op.getOffset())].insert(op.getBack());
+        getOps[std::make_tuple(bufOp.getNameAttr(), op.getOffset(), op.getBack())].push_back(op);
+        return WalkResult::advance();
+      });
+      if (res.wasInterrupted())
+        return WalkResult::interrupt();
       return WalkResult::advance();
     });
 
@@ -71,7 +88,7 @@ struct GenerateTapsPass : public GenerateTapsBase<GenerateTapsPass> {
       signalPassFailure();
     }
 
-    SmallVector<Attribute> taps;
+    SmallVector<Zll::TapAttr> taps;
     for (auto tapBuf : bufs.getTapBuffers()) {
       for (size_t offset = 0; offset != tapBuf.getRegCount(); ++offset) {
         SmallVector<size_t> backs =
@@ -93,8 +110,12 @@ struct GenerateTapsPass : public GenerateTapsBase<GenerateTapsPass> {
 
     Type tapArrayType = builder.getType<ArrayType>(builder.getType<TapType>(), taps.size());
 
-    builder.create<GlobalConstOp>(
-        loc, Zhlt::getTapsConstName(), tapArrayType, ArrayAttr::get(ctx, taps));
+    builder.create<GlobalConstOp>(loc,
+                                  Zhlt::getTapsConstName(),
+                                  tapArrayType,
+                                  builder.getArrayAttr(llvm::to_vector_of<Attribute>(taps)));
+
+    Zll::setModuleAttr(module, builder.getAttr<Zll::TapsAttr>(taps));
   }
 };
 

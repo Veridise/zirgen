@@ -26,8 +26,8 @@ def AnyScalar : AnyTypeOf<[Val, Digest]>;
 def ExternParameter : AnyTypeOf<[AnyScalar, String, VariadicPack]>;
 def Sha256Digest :
     Type<And<[
-      CPred<"$_self.isa<DigestType>()">,
-      CPred<"$_self.cast<DigestType>().getKind() == DigestKind::Sha256">]>>,
+      CPred<"mlir::isa<DigestType>($_self)">,
+      CPred<"mlir::cast<DigestType>($_self).getKind() == DigestKind::Sha256">]>>,
     BuildableType<"DigestType::get($_builder.getContext(), DigestKind::Sha256)">
 {}
 
@@ -90,18 +90,18 @@ def SliceOp : ZllOp<"slice", [Pure, InferTypeOpAdaptor]> {
 }
 
 def GetOp : ZllOp<"get", [Pure, EvalOpAdaptor, IsPoly, InferTypeOpAdaptor,
-                             CodegenOpWithProperties<["Offset", "Back"]>]> {
+                             DeclareOpInterfaceMethods<CodegenExprOpInterface>]> {
   let arguments = (ins Buffer:$buf, UI32Attr:$offset, UI32Attr:$back, OptionalAttr<UI32Attr>:$tap);
   let results = (outs Val:$out);
   let assemblyFormat = [{ $buf `[` $offset `]` `back` $back (`tap` $tap^)? `:` type($buf) attr-dict }];
   let hasCanonicalizer = 1;
   let hasVerifier = 1;
   let extraClassDeclaration = [{
-    BufferKind getBufferKind() { return getBuf().getType().cast<BufferType>().getKind(); }
+    BufferKind getBufferKind() { return mlir::cast<BufferType>(getBuf().getType()).getKind(); }
   }];
 }
 
-def SetOp : ZllOp<"set", [EvalOpAdaptor, CodegenOpWithProperties<["Offset"]>]> {
+def SetOp : ZllOp<"set", [EvalOpAdaptor, DeclareOpInterfaceMethods<CodegenExprOpInterface>]> {
   let arguments = (ins Buffer:$buf, UI32Attr:$offset, Val:$in);
   let assemblyFormat = [{ $buf `:` type($buf) `[` $offset `]` `=` $in `:` type($in) attr-dict }];
   let hasCanonicalizer = 1;
@@ -110,6 +110,7 @@ def SetOp : ZllOp<"set", [EvalOpAdaptor, CodegenOpWithProperties<["Offset"]>]> {
 
 def GetGlobalOp : ZllOp<"get_global", [Pure, EvalOpAdaptor, IsPoly, InferTypeOpAdaptor,
                                           CodegenOpWithProperties<["Offset"]>]> {
+  let summary = "Read from a buffer that doesn't support cycle offsets (e.g. a Global or Temporary buffer)";
   let arguments = (ins Buffer:$buf, UI32Attr:$offset);
   let results = (outs Val:$out);
   let assemblyFormat = [{ $buf `[` $offset `]` `:` type($buf) attr-dict }];
@@ -118,7 +119,8 @@ def GetGlobalOp : ZllOp<"get_global", [Pure, EvalOpAdaptor, IsPoly, InferTypeOpA
 }
 
 def SetGlobalOp : ZllOp<"set_global", [EvalOpAdaptor, IsReduce,
-                                          CodegenOpWithProperties<["Offset"]>]> {
+                                       DeclareOpInterfaceMethods<CodegenExprOpInterface>]> {
+  let summary = "Store to a buffer that doesn't support cycle offsets (e.g. a Global or Temporary buffer)";
   let arguments = (ins Buffer:$buf, UI32Attr:$offset, Val:$in);
   let assemblyFormat = [{ $buf `:` type($buf) `[` $offset `]` `=` $in `:` type($in) attr-dict }];
   let hasCanonicalizer = 1;
@@ -173,6 +175,7 @@ def AddOp : BinaryOp<"add", [Pure, Commutative, IsPoly, CodegenInfixOp<"+">]> {}
 def SubOp : BinaryOp<"sub", [Pure, IsPoly, CodegenInfixOp<"-">]> {}
 def MulOp : BinaryOp<"mul", [Pure, Commutative, IsPoly, CodegenInfixOp<"*">]> {}
 def BitAndOp : BinaryOp<"bit_and", [Pure]> {}
+def ModOp : BinaryOp<"mod", [Pure]> {}
 
 def InRangeOp : ZllOp<"in_range", [Pure, SameOperandsAndResultType]> {
   let summary = [{
@@ -254,7 +257,7 @@ def IntoDigestOp : ZllOp<"into_digest", [Pure, EvalOpAdaptor]> {
 }
 
 def FromDigestOp : ZllOp<"from_digest", [Pure, EvalOpAdaptor]> {
-  let summary = "Reinterpret a diest into field elements";
+  let summary = "Reinterpret a digest into field elements";
   let assemblyFormat = [{ $in `:` type($in) `->` custom<ArrType>(type($out)) attr-dict }];
   let arguments = (ins Digest:$in);
   let results = (outs Variadic<Val>:$out);
@@ -312,4 +315,14 @@ def NormalizeOp : ZllOp<"normalize", [Pure, EvalOpAdaptor, IsReduce, InferTypeOp
       DefaultValuedAttr<UI32Attr, "0">:$bits,
       DefaultValuedAttr<StrAttr, "\"\"">:$low);
   let results = (outs Val:$out);
+}
+
+def MakeTemporaryBufferOp : ZllOp<"temp_buffer"> {
+  let summary = "Create a temporary buffer that can be used by `load` and `store`.";
+  let builders = [
+    OpBuilder<(ins "Zll::ValType":$element, "unsigned":$size), [{
+      build($_builder, $_state, $_builder.getType<zirgen::Zll::BufferType>(element, size, Zll::BufferKind::Temporary));
+    }]>
+  ];
+  let results = (outs Buffer:$out);
 }

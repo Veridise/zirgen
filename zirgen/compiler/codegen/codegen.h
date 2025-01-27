@@ -19,7 +19,9 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
 #include "zirgen/Dialect/Zll/IR/Codegen.h"
+#include "zirgen/compiler/codegen/Passes.h"
 #include "zirgen/compiler/codegen/protocol_info_const.h"
+#include "llvm/Support/ManagedStatic.h"
 
 #include <memory>
 #include <string>
@@ -33,7 +35,8 @@ class RustStreamEmitter {
 public:
   virtual ~RustStreamEmitter() = default;
   virtual void emitStepFunc(const std::string& name, mlir::func::FuncOp func) = 0;
-  virtual void emitPolyFunc(const std::string& fn, mlir::func::FuncOp func) = 0;
+  virtual void
+  emitPolyFunc(const std::string& fn, mlir::func::FuncOp func, size_t idx, size_t nsplit) = 0;
   virtual void emitPolyExtFunc(mlir::func::FuncOp func) = 0;
   virtual void emitTaps(mlir::func::FuncOp func) = 0;
   virtual void emitInfo(mlir::func::FuncOp func) = 0;
@@ -42,7 +45,8 @@ public:
 class GpuStreamEmitter {
 public:
   virtual ~GpuStreamEmitter() = default;
-  virtual void emitPoly(mlir::func::FuncOp func) = 0;
+  virtual void
+  emitPoly(mlir::func::FuncOp func, size_t idx, size_t nsplit, bool declsOnly = false) = 0;
   virtual void emitStepFunc(const std::string& name, mlir::func::FuncOp func) = 0;
 };
 
@@ -95,6 +99,11 @@ private:
                           llvm::ArrayRef<CodegenIdent<IdentKind::Var>> argNames,
                           mlir::FunctionType funcType,
                           mlir::Region* body) override;
+  void emitFuncDeclaration(CodegenEmitter& cg,
+                           CodegenIdent<IdentKind::Func> funcName,
+                           llvm::ArrayRef<std::string> contextArgs,
+                           llvm::ArrayRef<CodegenIdent<IdentKind::Var>> argNames,
+                           mlir::FunctionType funcType) override;
 
   void emitReturn(CodegenEmitter& cg, llvm::ArrayRef<CodegenValue> values) override;
 
@@ -106,6 +115,8 @@ private:
   void emitSaveConst(CodegenEmitter& cg,
                      CodegenIdent<IdentKind::Const> name,
                      CodegenValue value) override;
+  void
+  emitConstDecl(CodegenEmitter& cg, CodegenIdent<IdentKind::Const> name, mlir::Type type) override;
 
   void emitCall(CodegenEmitter& cg,
                 CodegenIdent<IdentKind::Func> callee,
@@ -148,9 +159,16 @@ private:
                      llvm::ArrayRef<mlir::Type> types) override;
 
   llvm::StringSet<> itemsMacros;
+  llvm::DenseMap<mlir::Type, bool> typesNeedLifetime;
 
 private:
+  void emitStructDefImpl(CodegenEmitter& cg,
+                         mlir::Type ty,
+                         llvm::ArrayRef<CodegenIdent<IdentKind::Field>> names,
+                         llvm::ArrayRef<mlir::Type> types,
+                         bool layout);
   void emitValueWithReferenceIfNeeded(CodegenEmitter& cg, CodegenValue value);
+  bool typeNeedsLifetime(mlir::Type ty);
 };
 
 struct CppLanguageSyntax : public LanguageSyntax {
@@ -171,6 +189,11 @@ struct CppLanguageSyntax : public LanguageSyntax {
                           llvm::ArrayRef<CodegenIdent<IdentKind::Var>> argNames,
                           mlir::FunctionType funcType,
                           mlir::Region* body) override;
+  void emitFuncDeclaration(CodegenEmitter& cg,
+                           CodegenIdent<IdentKind::Func> funcName,
+                           llvm::ArrayRef<std::string> contextArgs,
+                           llvm::ArrayRef<CodegenIdent<IdentKind::Var>> argNames,
+                           mlir::FunctionType funcType) override;
 
   void emitReturn(CodegenEmitter& cg, llvm::ArrayRef<CodegenValue> values) override;
 
@@ -182,6 +205,8 @@ struct CppLanguageSyntax : public LanguageSyntax {
   void emitSaveConst(CodegenEmitter& cg,
                      CodegenIdent<IdentKind::Const> name,
                      CodegenValue value) override;
+  void
+  emitConstDecl(CodegenEmitter& cg, CodegenIdent<IdentKind::Const> name, mlir::Type type) override;
 
   void emitCall(CodegenEmitter& cg,
                 CodegenIdent<IdentKind::Func> callee,
@@ -222,9 +247,18 @@ struct CppLanguageSyntax : public LanguageSyntax {
                      mlir::Type ty,
                      llvm::ArrayRef<CodegenIdent<IdentKind::Field>> fields,
                      llvm::ArrayRef<mlir::Type> types) override;
+
+private:
+  void emitStructDefImpl(CodegenEmitter& cg,
+                         mlir::Type ty,
+                         llvm::ArrayRef<CodegenIdent<IdentKind::Field>> names,
+                         llvm::ArrayRef<mlir::Type> types,
+                         bool layout);
 };
 
 struct CudaLanguageSyntax : public CppLanguageSyntax {
+  void
+  emitConstDecl(CodegenEmitter& cg, CodegenIdent<IdentKind::Const> name, mlir::Type type) override;
   void emitSaveConst(CodegenEmitter& cg,
                      CodegenIdent<IdentKind::Const> name,
                      CodegenValue value) override;
@@ -234,6 +268,17 @@ struct CudaLanguageSyntax : public CppLanguageSyntax {
                           mlir::Type ty,
                           mlir::Type elemType,
                           llvm::ArrayRef<CodegenValue> values) override;
+  void emitFuncDefinition(CodegenEmitter& cg,
+                          CodegenIdent<IdentKind::Func> funcName,
+                          llvm::ArrayRef<std::string> contextArgs,
+                          llvm::ArrayRef<CodegenIdent<IdentKind::Var>> argNames,
+                          mlir::FunctionType funcType,
+                          mlir::Region* body) override;
+  void emitFuncDeclaration(CodegenEmitter& cg,
+                           CodegenIdent<IdentKind::Func> funcName,
+                           llvm::ArrayRef<std::string> contextArgs,
+                           llvm::ArrayRef<CodegenIdent<IdentKind::Var>> argNames,
+                           mlir::FunctionType funcType) override;
 };
 
 // Returns codegen options for emitting specific language variants,
@@ -249,8 +294,8 @@ std::unique_ptr<GpuStreamEmitter> createGpuStreamEmitter(llvm::raw_ostream& ofs,
                                                          const std::string& suffix);
 std::unique_ptr<CppStreamEmitter> createCppStreamEmitter(llvm::raw_ostream& ofs);
 
-void registerCodegenCLOptions();
 void emitCode(mlir::ModuleOp module, const EmitCodeOptions& opts = {});
+void emitCodeZirgenPoly(mlir::ModuleOp module, llvm::StringRef outputDir);
 void emitRecursion(const std::string& path,
                    mlir::func::FuncOp func,
                    recursion::EncodeStats* stats = nullptr);
@@ -262,6 +307,7 @@ struct FileContext {
   std::string use(mlir::Value value) const {
     auto it = vars.find(value);
     if (it == vars.end()) {
+      llvm::errs() << "Missing use: " << value << "\n";
       throw std::runtime_error("Missing use");
     }
     return it->second;
@@ -275,5 +321,21 @@ struct FileContext {
 };
 
 std::string escapeString(llvm::StringRef str);
+
+struct CodegenCLOptions {
+  llvm::cl::opt<std::string> outputDir{"output-dir",
+                                       llvm::cl::desc("Output directory"),
+                                       llvm::cl::value_desc("dir"),
+                                       llvm::cl::Required};
+  llvm::cl::opt<size_t> validitySplitCount{
+      "validity-split-count",
+      llvm::cl::desc(
+          "Split up validity polynomial into this many files to allow for parallel compilation"),
+      llvm::cl::value_desc("numParts"),
+      llvm::cl::init(1)};
+};
+
+extern llvm::ManagedStatic<CodegenCLOptions> codegenCLOptions;
+void registerCodegenCLOptions();
 
 } // namespace zirgen

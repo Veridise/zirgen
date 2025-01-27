@@ -34,28 +34,57 @@ llvm::StringRef trimFilename(llvm::StringRef fn) {
 }
 
 std::string getLocString(mlir::Location loc) {
-  auto named = loc->dyn_cast<mlir::NameLoc>();
+  std::string out;
+  auto named = mlir::dyn_cast<mlir::NameLoc>(loc);
   if (named) {
-    auto innerLoc = named.getChildLoc()->dyn_cast<mlir::FileLineColLoc>();
+    auto innerLoc = mlir::dyn_cast<mlir::FileLineColLoc>(named.getChildLoc());
     if (innerLoc) {
-      return llvm::formatv("{0}({1}:{2})",
-                           named.getName(),
-                           trimFilename(innerLoc.getFilename()),
-                           innerLoc.getLine());
+      out = llvm::formatv("{0}({1}:{2})",
+                          named.getName(),
+                          trimFilename(innerLoc.getFilename()),
+                          innerLoc.getLine());
     } else {
-      return llvm::formatv("{0}", named.getName());
+      out = llvm::formatv("{0}", named.getName());
+    }
+  } else {
+    auto fileLineCol = mlir::dyn_cast<mlir::FileLineColLoc>(loc);
+    if (fileLineCol) {
+      out =
+          llvm::formatv("{0}:{1}", trimFilename(fileLineCol.getFilename()), fileLineCol.getLine());
     }
   }
 
-  auto fileLineCol = loc->dyn_cast<mlir::FileLineColLoc>();
-  if (fileLineCol) {
-    return llvm::formatv("{0}:{1}", trimFilename(fileLineCol.getFilename()), fileLineCol.getLine());
+  if (out.empty()) {
+    llvm::raw_string_ostream rso(out);
+    loc.print(rso);
   }
 
-  std::string out;
-  llvm::raw_string_ostream rso(out);
-  loc.print(rso);
+  for (auto& c : out) {
+    if (c == '\n' || c == '"' || c == '\r')
+      c = ' ';
+  }
   return out;
+}
+
+void reinferReturnType(mlir::InferTypeOpInterface op) {
+  llvm::SmallVector<mlir::Type> newTypes;
+  if (failed(op.inferReturnTypes(op.getContext(),
+                                 op->getLoc(),
+                                 op->getOperands(),
+                                 op->getAttrDictionary(),
+                                 op->getPropertiesStorage(),
+                                 op->getRegions(),
+                                 newTypes)))
+    return;
+
+  if (mlir::TypeRange(newTypes) != op->getResultTypes()) {
+    for (auto [newType, result] : llvm::zip_equal(newTypes, op->getResults()))
+      result.setType(newType);
+    for (mlir::Operation* user : op->getUsers()) {
+      if (auto inferUser = llvm::dyn_cast<mlir::InferTypeOpInterface>(user))
+        reinferReturnType(inferUser);
+    }
+  }
 }
 
 } // namespace zirgen::Zll

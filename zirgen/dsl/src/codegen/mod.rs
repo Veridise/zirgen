@@ -59,54 +59,34 @@ macro_rules! zirgen_inhibit_warnings {
 ///    struct ValidityTapsContext...;
 #[macro_export]
 macro_rules! zirgen_preamble {
-    ($protocol_info:expr) => {
+    {} => {
         use anyhow::{bail, Context, Result};
         use risc0_zkp::adapter::ProtocolInfo;
+        use risc0_zkp::layout::Reg;
+        use risc0_zkp::field::Elem;
         use $crate::codegen::_support::*;
         use $crate::codegen::taps::{make_taps, Tap};
-        use $crate::{BoundLayout, BufferRow, BufferSpec, Buffers};
-
-        lazy_static::lazy_static! {
-            pub static ref TAPS : risc0_zkp::taps::TapSet<'static> = make_taps(TAP_LIST.as_slice(),
-                                                                               TAP_GROUP_NAMES);
-        }
+        use $crate::{BoundLayout, BufferRow, BufferSpec, Buffers, CycleContext};
 
         // Explicitly instantiate calls that cause rustc to be very slow
         // when processing large generated code.
+        fn trivial_constraint() -> Result<MixState> {
+            Ok(MixState {
+                tot: ExtVal::ZERO,
+                mul: ExtVal::ONE,
+            })
+        }
+
         fn and_cond(x: MixState, cond: Val, inner: MixState) -> Result<MixState> {
             and_cond_generic::<CircuitField, Val>(x, cond, inner)
         }
+
         fn and_cond_ext(x: MixState, cond: ExtVal, inner: MixState) -> Result<MixState> {
             and_cond_generic::<CircuitField, ExtVal>(x, cond, inner)
         }
-        fn and_eqz(poly_mix: ExtVal, x: MixState, val: Val) -> Result<MixState> {
-            and_eqz_generic::<CircuitField, Val>(poly_mix, x, val)
-        }
-        fn and_eqz_ext(poly_mix: ExtVal, x: MixState, val: ExtVal) -> Result<MixState> {
-            and_eqz_generic::<CircuitField, ExtVal>(poly_mix, x, val)
-        }
-        fn load(buf: BoundLayout<Reg, impl BufferRow<ValType = Val>>, back: usize) -> Val {
-            buf.buf().load(buf.layout().offset, back)
-        }
-        fn load_ext(buf: BoundLayout<Reg, impl BufferRow<ValType = Val>>, back: usize) -> ExtVal {
-            ExtVal::new(
-                buf.buf().load(buf.layout().offset + 0, back),
-                buf.buf().load(buf.layout().offset + 1, back),
-                buf.buf().load(buf.layout().offset + 2, back),
-                buf.buf().load(buf.layout().offset + 3, back),
-            )
-        }
-        fn store(buf: BoundLayout<Reg, impl BufferRow<ValType = Val>>, val: Val) {
-            buf.buf().store(buf.layout().offset, val)
-        }
-        fn store_ext(buf: BoundLayout<Reg, impl BufferRow<ValType = Val>>, val: ExtVal) {
-            for (i, coef) in val.elems().iter().enumerate() {
-                buf.buf().store(buf.layout().offset + i, *coef);
-            }
-        }
-        fn alias_layout<Layout: PartialEq, B: BufferRow>(
-            x: BoundLayout<Layout, B>,
-            y: BoundLayout<Layout, B>,
+        fn alias_layout<Layout: PartialEq, E: Elem>(
+            x: BoundLayout<Layout, E>,
+            y: BoundLayout<Layout, E>,
         ) -> Result<()> {
             if x == y {
                 Ok(())
@@ -115,55 +95,9 @@ macro_rules! zirgen_preamble {
             }
         }
 
-        // risc0_zkp-compatible CircuitDef
-        pub struct CircuitDef;
-        type ValidityRegsContext<'a> = $crate::cpu::CpuBuffers<'a, Val, ()>;
-        type ValidityTapsContext<'a> = $crate::Buffers<(), &'a [Val], ()>;
-        impl risc0_zkp::adapter::CircuitInfo for CircuitDef {
-            const CIRCUIT_INFO: ProtocolInfo = ProtocolInfo($protocol_info);
-            const OUTPUT_SIZE: usize = REGCOUNT_GLOBAL;
-            const MIX_SIZE: usize = REGCOUNT_MIX;
-        }
-        impl risc0_zkp::adapter::PolyExt<CircuitField> for CircuitDef {
-            fn poly_ext(&self, mix: &ExtVal, u: &[ExtVal], args: &[&[Val]]) -> MixState {
-                use risc0_zkp::field::Elem;
-
-                let raw_buffers = get_named_buffers($crate::poly_ext_named_buffers(args));
-                let buffers =
-                    raw_buffers.map_rows(|x| -> () { panic!("Unexpected tap in poly_ext") });
-                assert_eq!(u.len(), TAP_LIST.len());
-
-                let res = validity_taps(&buffers, &u, *mix, get_global_buffer(&buffers)).unwrap();
-
-                res
-            }
-        }
-
-        impl risc0_zkp::adapter::TapsProvider for CircuitDef {
-            fn get_taps(&self) -> &'static risc0_zkp::taps::TapSet<'static> {
-                &*TAPS
-            }
-        }
-
-        impl risc0_zkp::adapter::CircuitCoreDef<CircuitField> for CircuitDef {}
-
-        #[derive(Debug, Copy, Clone, PartialEq)]
-        pub struct Reg {
-            pub offset: usize,
-        }
-
-        impl risc0_zkp::layout::Component for Reg {
-            fn walk<V: risc0_zkp::layout::Visitor>(&self, v: &mut V) -> core::fmt::Result {
-                v.visit_reg(self.offset)
-            }
-            fn ty_name(&self) -> &'static str {
-                "reg"
-            }
-        }
-
         // Eventually we want to generate this trait based on what functions are available,
         // but for now we can hardcode it.
-        pub trait CircuitHal<'a, H: risc0_zkp::hal::Hal<Elem = Val>> {
+        pub trait CircuitHal<H: risc0_zkp::hal::Hal<Elem = Val>> {
             fn step_exec(
                 &self,
                 tot_cycles: usize,
@@ -185,7 +119,7 @@ macro_rules! zirgen_preamble {
 /// Default implementation of "log" for circuits.  Circuits can take advantage
 /// of this implementation by supplying a forwarding function such as this on
 /// a context object:
-///    pub fn log(& self, message: &str, x: &[Val]) -> Result<()> {
+///    pub fn log(& self, message: &str, x: &\[Val\]) -> Result<()> {
 ///        default_log(message, x)
 ///    }
 pub fn default_log<E: risc0_zkp::field::Elem + Into<u32>>(

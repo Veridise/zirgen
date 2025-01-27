@@ -1,4 +1,3 @@
-load("@rules_pkg//pkg:zip.bzl", "pkg_zip")
 load("//bazel/rules/lit:defs.bzl", "glob_lit_tests")
 load("//bazel/rules/zirgen:edsl-defs.bzl", "ZIRGEN_OUTS", "build_circuit")
 
@@ -21,14 +20,29 @@ glob_lit_tests(
     test_file_exts = ["zir"],
 )
 
+KECCAK_OUTS = ZIRGEN_OUTS + [
+    "rust_poly_fp_0.cpp",
+    "rust_poly_fp_1.cpp",
+    "rust_poly_fp_2.cpp",
+    "rust_poly_fp_3.cpp",
+    "rust_poly_fp_4.cpp",
+    "eval_check_0.cu",
+    "eval_check_1.cu",
+    "eval_check_2.cu",
+    "eval_check_3.cu",
+    "eval_check_4.cu",
+    "eval_check.cuh",
+]
+
 build_circuit(
     name = "keccak",
-    outs = ZIRGEN_OUTS,
+    outs = KECCAK_OUTS,
     bin = "//zirgen/Main:gen_zirgen",
     data = KECCAK_ZIR_FILES,
     extra_args = [
         "zirgen/circuit/keccak/keccak.zir",
         "-I",
         "zirgen/circuit/keccak",
+        "--validity-split-count=5",
     ],
 )

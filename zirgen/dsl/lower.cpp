@@ -277,7 +277,7 @@ void Impl::gen(ast::Statement* s, SymbolTable& symbols) {
       .Case<ast::Definition>([&](ast::Definition* s) {
         mlir::Location sl(loc(s));
         llvm::StringRef name = s->getName();
-        if (s->getIsGlobal()) {
+        if (ast::Access::Global == s->getAccess()) {
           auto construct = dynamic_cast<ast::Construct*>(s->getValue());
           if (!construct) {
             mlir::emitError(sl) << "Expecting a global definition to construct a component";
@@ -306,7 +306,9 @@ void Impl::gen(ast::Statement* s, SymbolTable& symbols) {
               diag << "Only constructor parameters may be shadowed.";
               diag.attachNote(def->location) << "see previous definition";
             }
-            declaration = builder.create<DeclarationOp>(sl, exprType, name, mlir::Value()).getOut();
+            bool isPublic = s->getAccess() == ast::Access::Public;
+            declaration =
+                builder.create<DeclarationOp>(sl, exprType, name, isPublic, mlir::Value()).getOut();
             symbols.define(name, {declaration, Source::Declaration, sl});
           }
           builder.create<DefinitionOp>(sl, declaration, definition);
@@ -317,11 +319,13 @@ void Impl::gen(ast::Statement* s, SymbolTable& symbols) {
         mlir::Location sl(loc(s));
         llvm::StringRef name = s->getName();
         mlir::Value type = gen(s->getType(), symbols);
-        if (s->getIsGlobal()) {
+        if (ast::Access::Global == s->getAccess()) {
           mlir::Value declaration = builder.create<GetGlobalOp>(sl, name, type).getOut();
           symbols.define(name, {declaration, Source::Global, sl});
         } else {
-          mlir::Value declaration = builder.create<DeclarationOp>(sl, name, type).getOut();
+          bool isPublic = s->getAccess() == ast::Access::Public;
+          mlir::Value declaration =
+              builder.create<DeclarationOp>(sl, name, isPublic, type).getOut();
           symbols.define(name, {declaration, Source::Declaration, sl});
         }
       })
@@ -352,6 +356,11 @@ void Impl::gen(ast::Component* c, SymbolTable& outerscope) {
   }
   if (c->getTypeParams().size()) {
     op->setAttr("generic", mlir::UnitAttr::get(&ctx));
+  }
+
+  for (ast::Attribute::Ptr attr : c->getAttributes()) {
+    llvm::StringRef name = attr->getName();
+    op->setAttr(name, mlir::UnitAttr::get(&ctx));
   }
 
   mlir::Region* region = &op.getBody();

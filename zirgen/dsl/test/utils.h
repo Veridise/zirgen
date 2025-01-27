@@ -23,6 +23,7 @@ namespace utils {
 // Helper functions for more concise test-case implementations
 
 // using namespace zirgen::dsl;
+using AttrVec = ast::Attribute::Vec;
 using Expr = ast::Expression::Ptr;
 using ExprVec = ast::Expression::Vec;
 using Stmt = ast::Statement::Ptr;
@@ -34,6 +35,7 @@ using CompVec = ast::Component::Vec;
 using Mod = ast::Module::Ptr;
 using std::make_unique;
 using std::string;
+using Access = ast::Access;
 
 template <typename T> string print(T&& node) {
   string result;
@@ -94,8 +96,8 @@ Expr Ident(string name);
 Expr Lookup(Expr&& component, string member);
 Expr Subscript(Expr&& array, Expr&& element);
 Expr Specialize(Expr&& type, ExprVec&& args);
-Stmt Definition(string name, Expr&& value, bool isGlobal = false);
-Stmt Declaration(string name, Expr&& type, bool isGlobal = false);
+Stmt Definition(string name, Expr&& value, Access access = Access::Default);
+Stmt Declaration(string name, Expr&& type, Access access = Access::Default);
 Stmt Constraint(Expr&& lhs, Expr&& rhs);
 Stmt Void(Expr&& expression);
 Expr Block(StmtVec&& body, Expr value);

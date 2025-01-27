@@ -26,6 +26,16 @@ namespace mlir {
 class ZirgenInlinerInterface : public DialectInlinerInterface {
   using DialectInlinerInterface::DialectInlinerInterface;
 
+  bool isLegalToInline(Operation* call, Operation* callable, bool wouldBeCloned) const final {
+    return true;
+  }
+
+  bool isLegalToInline(Region* dest,
+                       Region* src,
+                       bool wouldBeCloned,
+                       IRMapping& valueMapping) const final {
+    return true;
+  }
   bool
   isLegalToInline(Operation* op, Region* dest, bool wouldBeCloned, IRMapping& valueMapping) const {
     // All ops in this dialect are inlinable
@@ -81,8 +91,11 @@ void ZllDialect::initialize() {
 
 Operation*
 ZllDialect::materializeConstant(OpBuilder& builder, Attribute value, Type type, Location loc) {
-  if (auto polyAttr = value.dyn_cast<PolynomialAttr>()) {
-    return builder.create<ConstOp>(loc, type, polyAttr);
+  if (auto polyAttr = dyn_cast<PolynomialAttr>(value)) {
+    // Promote to requested return type.
+    SmallVector<uint64_t> elems = llvm::to_vector(polyAttr.asArrayRef());
+    elems.resize(llvm::cast<ValType>(type).getFieldK());
+    return builder.create<ConstOp>(loc, builder.getAttr<PolynomialAttr>(elems));
   }
   return nullptr;
 }

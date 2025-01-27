@@ -16,6 +16,7 @@
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "zirgen/Dialect/ZStruct/IR/ZStruct.h"
 #include "zirgen/Dialect/Zll/IR/Interpreter.h"
+#include "llvm/ADT/Sequence.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -44,9 +45,9 @@ LogicalResult LookupOp::verify() {
   }
   Type outType = getOut().getType();
   for (auto& field : *elements) {
-    if (!member.equals(field.name)) {
+    if (member != field.name)
       continue;
-    }
+
     if (outType != field.type) {
       emitError() << "Field type " << field.type << " but out type " << outType << "\n";
       return failure();
@@ -144,10 +145,6 @@ OpFoldResult SubscriptOp::fold(FoldAdaptor adaptor) {
     }
   }
 
-  if (auto layoutArrayOp = getBase().getDefiningOp<LayoutArrayOp>()) {
-    return layoutArrayOp.getElements()[index];
-  }
-
   if (Attribute base = derefConst(*this, adaptor.getBase())) {
     if (auto arrayAttr = llvm::dyn_cast_if_present<mlir::ArrayAttr>(adaptor.getBase())) {
       if (index < arrayAttr.getValue().size()) {
@@ -174,8 +171,8 @@ mlir::IntegerAttr SubscriptOp::getIndexAsAttr() {
   SmallVector<OpFoldResult, 4> foldResults;
   if (succeeded(indexOp->fold(foldResults))) {
     assert(foldResults.size() == 1);
-    if (auto attr = foldResults[0].dyn_cast<Attribute>()) {
-      return attr.cast<mlir::IntegerAttr>();
+    if (auto attr = dyn_cast<Attribute>(foldResults[0])) {
+      return cast<mlir::IntegerAttr>(attr);
     }
   }
   return nullptr;
@@ -244,7 +241,7 @@ LogicalResult SubscriptOp::verify() {
 }
 
 LogicalResult LoadOp::verify() {
-  auto inElemType = getRef().getType().cast<RefType>().getElement();
+  auto inElemType = cast<RefType>(getRef().getType()).getElement();
   auto outElemType = getOut().getType();
   if (inElemType == outElemType)
     return success();
@@ -271,7 +268,7 @@ void LoadOp::emitExpr(zirgen::codegen::CodegenEmitter& cg) {
 }
 
 LogicalResult StoreOp::verify() {
-  if (getRef().getType().cast<RefType>().getElement() != getVal().getType()) {
+  if (cast<RefType>(getRef().getType()).getElement() != getVal().getType()) {
     return emitError() << "Source value type must match destination ref element type";
   }
   return success();
@@ -316,6 +313,165 @@ OpFoldResult PackOp::fold(FoldAdaptor adaptor) {
   }
 
   return StructAttr::get(getContext(), DictionaryAttr::get(getContext(), fieldVals), getType());
+}
+
+namespace {
+
+struct LookupLayoutPattern : public OpRewritePattern<LookupOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(LookupOp op, PatternRewriter& rewriter) const override {
+    auto bindLayout = op.getBase().getDefiningOp<BindLayoutOp>();
+    if (!bindLayout)
+      return rewriter.notifyMatchFailure(op, "layout not from BindLayoutOp");
+
+    auto layoutAttr = llvm::dyn_cast<StructAttr>(bindLayout.getLayout());
+    if (!layoutAttr)
+      return rewriter.notifyMatchFailure(op, "Layout not StructAttr");
+
+    auto newLayout = layoutAttr.getFields().get(op.getMember());
+    if (!newLayout)
+      return rewriter.notifyMatchFailure(op, "Missing layout member");
+
+    rewriter.replaceOpWithNewOp<BindLayoutOp>(op, op.getType(), newLayout, bindLayout.getBuffer());
+
+    return success();
+  }
+};
+
+struct SubscriptLayoutPattern : public OpRewritePattern<SubscriptOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(SubscriptOp op, PatternRewriter& rewriter) const override {
+    Attribute indexValue;
+    if (!matchPattern(op.getIndex(), m_Constant(&indexValue)))
+      return rewriter.notifyMatchFailure(op, "index not a constant");
+    size_t idx = extractIntAttr(indexValue);
+
+    auto bindLayout = op.getBase().getDefiningOp<BindLayoutOp>();
+    if (!bindLayout)
+      return rewriter.notifyMatchFailure(op, "layout not from BindLayoutOp");
+
+    auto layoutAttr = llvm::dyn_cast<ArrayAttr>(bindLayout.getLayout());
+    if (!layoutAttr)
+      return rewriter.notifyMatchFailure(op, "Layout not ArrayAttr");
+
+    if (idx > layoutAttr.size())
+      return rewriter.notifyMatchFailure(op, "index out of range");
+    auto newLayout = layoutAttr[idx];
+    rewriter.replaceOpWithNewOp<BindLayoutOp>(op, op.getType(), newLayout, bindLayout.getBuffer());
+
+    return success();
+  }
+};
+
+struct LoadLayoutPattern : public OpRewritePattern<LoadOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(LoadOp op, PatternRewriter& rewriter) const override {
+    Attribute distanceValue;
+    if (!matchPattern(op.getDistance(), m_Constant(&distanceValue)))
+      return rewriter.notifyMatchFailure(op, "distance not a constant");
+    size_t distance = extractIntAttr(distanceValue);
+
+    auto bindLayout = op.getRef().getDefiningOp<BindLayoutOp>();
+    if (!bindLayout)
+      return rewriter.notifyMatchFailure(op, "layout not from BindLayoutOp");
+
+    auto layoutAttr = llvm::dyn_cast<RefAttr>(bindLayout.getLayout());
+    if (!layoutAttr)
+      return rewriter.notifyMatchFailure(op, "Layout not RefAttr");
+    size_t offset = layoutAttr.getIndex();
+
+    auto bufType = llvm::dyn_cast<BufferType>(bindLayout.getBuffer().getType());
+    if (!bufType)
+      return rewriter.notifyMatchFailure(op, "binding not to a buffer");
+
+    auto valType = llvm::cast<ValType>(op.getType());
+
+    // zll.get doesn't support reading extension field elements,
+    // so read each part one at a time and multiply them out.
+    Value result;
+    Value shiftOnce;
+
+    for (size_t idx : llvm::reverse(llvm::seq(0u, valType.getFieldK()))) {
+      Value val;
+      if (bufType.getKind() == BufferKind::Global) {
+        if (distance)
+          return rewriter.notifyMatchFailure(op, "Cannot take back on global");
+        else
+          val = rewriter.create<Zll::GetGlobalOp>(
+              op.getLoc(), bufType.getElement(), bindLayout.getBuffer(), offset + idx);
+      } else {
+        auto getOp = rewriter.create<Zll::GetOp>(op.getLoc(),
+                                                 bufType.getElement(),
+                                                 bindLayout.getBuffer(),
+                                                 offset + idx,
+                                                 distance,
+                                                 /*optional tap=*/IntegerAttr{});
+        val = getOp;
+        if (op->getAttr("unchecked"))
+          getOp->setAttr("unchecked", rewriter.getUnitAttr());
+      }
+      if (result) {
+        if (!shiftOnce) {
+          auto shiftAttr = rewriter.getAttr<PolynomialAttr>(ArrayRef<uint64_t>{0, 1, 0, 0});
+          shiftOnce = rewriter.create<Zll::ConstOp>(op.getLoc(), shiftAttr);
+        }
+
+        result = rewriter.create<Zll::MulOp>(op.getLoc(), shiftOnce, result);
+        result = rewriter.create<Zll::AddOp>(op.getLoc(), val, result);
+      } else {
+        result = val;
+      }
+    }
+    assert(result && "no elements in extension field?");
+    rewriter.replaceOp(op, result);
+
+    return success();
+  }
+};
+
+struct StoreLayoutPattern : public OpRewritePattern<StoreOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(StoreOp op, PatternRewriter& rewriter) const override {
+    auto bindLayout = op.getRef().getDefiningOp<BindLayoutOp>();
+    if (!bindLayout)
+      return rewriter.notifyMatchFailure(op, "layout not from BindLayoutOp");
+
+    auto layoutAttr = llvm::dyn_cast<RefAttr>(bindLayout.getLayout());
+    if (!layoutAttr)
+      return rewriter.notifyMatchFailure(op, "Layout not RefAttr");
+    size_t offset = layoutAttr.getIndex();
+
+    auto bufType = llvm::dyn_cast<BufferType>(bindLayout.getBuffer().getType());
+    if (!bufType)
+      return rewriter.notifyMatchFailure(op, "binding not to a buffer");
+
+    if (bufType.getKind() == BufferKind::Global) {
+      rewriter.replaceOpWithNewOp<Zll::SetGlobalOp>(
+          op, bindLayout.getBuffer(), offset, op.getVal());
+    } else {
+      rewriter.replaceOpWithNewOp<Zll::SetOp>(op, bindLayout.getBuffer(), offset, op.getVal());
+    }
+
+    return success();
+  }
+};
+
+} // namespace
+
+void LookupOp::getCanonicalizationPatterns(RewritePatternSet& patterns, MLIRContext* context) {
+  patterns.add<LookupLayoutPattern>(context);
+}
+
+void SubscriptOp::getCanonicalizationPatterns(RewritePatternSet& patterns, MLIRContext* context) {
+  patterns.add<SubscriptLayoutPattern>(context);
+}
+
+void LoadOp::getCanonicalizationPatterns(RewritePatternSet& patterns, MLIRContext* context) {
+  patterns.add<LoadLayoutPattern>(context);
+}
+
+void StoreOp::getCanonicalizationPatterns(RewritePatternSet& patterns, MLIRContext* context) {
+  patterns.add<StoreLayoutPattern>(context);
 }
 
 LogicalResult LookupOp::inferReturnTypes(MLIRContext* ctx,
@@ -378,11 +534,32 @@ OpFoldResult LookupOp::fold(FoldAdaptor adaptor) {
 }
 
 void LookupOp::emitExpr(zirgen::codegen::CodegenEmitter& cg) {
+  // If we're looking up a path, put it all together at once.  This is
+  // especially useful for layouts since we only have to call
+  // layoutLookup once.
+  SmallVector<CodegenIdent<IdentKind::Field>> path;
+  LookupOp op = *this;
+  Value lastBase;
+  while (op) {
+    lastBase = op.getBase();
+    path.push_back(op.getMemberAttr());
+    op = op.getBase().getDefiningOp<LookupOp>();
+  }
+
   if (isLayoutType(getBase().getType())) {
+
     cg.emitInvokeMacro(cg.getStringAttr("layoutLookup"),
-                       {getBase(), CodegenIdent<IdentKind::Field>(getMemberAttr())});
+                       {lastBase, [&]() {
+                          llvm::interleave(
+                              llvm::reverse(path),
+                              *cg.getOutputStream(),
+                              [&](auto pathElem) { cg << pathElem; },
+                              ".");
+                        }});
   } else {
-    cg << getBase() << "." << CodegenIdent<codegen::IdentKind::Field>(getMemberAttr());
+    cg << lastBase << ".";
+    llvm::interleave(
+        llvm::reverse(path), *cg.getOutputStream(), [&](auto pathElem) { cg << pathElem; }, ".");
   }
 }
 
@@ -463,13 +640,6 @@ namespace {
 struct RemoveStaticCondition : public OpRewritePattern<SwitchOp> {
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(SwitchOp op, PatternRewriter& rewriter) const override {
-    // We can safely delete runtime side effects like witness generation and
-    // constraints, but we need to keep AliasLayoutOps around until layout
-    // generation.
-    auto walkResult = op.walk([](AliasLayoutOp) { return WalkResult::interrupt(); });
-    if (walkResult.wasInterrupted())
-      return failure();
-
     size_t numTrue = 0;
     size_t trueIndex;
     for (size_t i = 0; i < op.getSelector().size(); i++) {
@@ -490,6 +660,13 @@ struct RemoveStaticCondition : public OpRewritePattern<SwitchOp> {
                             << numTrue;
 
     if (numTrue == 1) {
+      // We can safely delete runtime side effects like witness generation and
+      // constraints, but we need to keep AliasLayoutOps around until layout
+      // generation.
+      auto walkResult = op.walk([](AliasLayoutOp) { return WalkResult::interrupt(); });
+      if (walkResult.wasInterrupted())
+        return failure();
+
       // We found the one true region; inline into parent.
       auto* region = op.getRegions()[trueIndex];
       assert(region->hasOneBlock() && "expected single-region block");
@@ -540,27 +717,6 @@ LogicalResult ArrayOp::inferReturnTypes(MLIRContext* ctx,
   return success();
 }
 
-OpFoldResult LayoutArrayOp::fold(FoldAdaptor adaptor) {
-  return ArrayAttr::get(getContext(), adaptor.getElements());
-}
-
-void LayoutArrayOp::emitExpr(zirgen::codegen::CodegenEmitter& cg) {
-  cg.emitArrayConstruct(getType(),
-                        getType().getElement(),
-                        llvm::to_vector_of<CodegenValue>(llvm::map_range(
-                            getElements(), [&](auto elem) { return CodegenValue(elem).owned(); })));
-}
-
-LogicalResult LayoutArrayOp::inferReturnTypes(MLIRContext* ctx,
-                                              std::optional<Location>,
-                                              Adaptor adaptor,
-                                              llvm::SmallVectorImpl<Type>& out) {
-  // The array elements are already the same type thanks to SameTypeOperands
-  Type elemType = adaptor.getElements().front().getType();
-  out.push_back(LayoutArrayType::get(ctx, elemType, adaptor.getElements().size()));
-  return success();
-}
-
 void MapOp::emitExpr(zirgen::codegen::CodegenEmitter& cg) {
   auto layout = getLayout() ? std::optional<CodegenValue>(getLayout()) : std::nullopt;
   cg.emitMapConstruct(getArray(), layout, getBody());
@@ -579,7 +735,7 @@ LogicalResult MapOp::verifyRegions() {
 
   if (getLayout()) {
     BlockArgument layoutElem = getBody().getArgument(1);
-    if (layoutElem.getType() != getLayout().getType().cast<LayoutArrayType>().getElement()) {
+    if (layoutElem.getType() != cast<LayoutArrayType>(getLayout().getType()).getElement()) {
       return emitOpError() << "wrong type of layout argument in body, array is "
                            << getLayout().getType() << " but induction var is "
                            << layoutElem.getType();
@@ -619,6 +775,10 @@ void GlobalConstOp::emitGlobal(codegen::CodegenEmitter& cg) {
   cg.emitConstDef(getSymNameAttr(), CodegenValue(getType(), getConstant()));
 }
 
+void GlobalConstOp::emitGlobalDecl(codegen::CodegenEmitter& cg) {
+  cg.emitConstDecl(getSymNameAttr(), getType());
+}
+
 LogicalResult LoadOp::evaluate(Interpreter& interp,
                                llvm::ArrayRef<zirgen::Zll::InterpVal*> outs,
                                EvalAdaptor& adaptor) {
@@ -632,7 +792,7 @@ LogicalResult LoadOp::evaluate(Interpreter& interp,
     return emitError() << "Cannot take back from global";
   }
 
-  if (distance > interp.getCycle()) {
+  if (distance > interp.getCycle() && !interp.getTotCycles()) {
     // TODO: Change this back to a throw once the DSL works enough that we can
     // avoid reading back too far.
     // throw std::runtime_error("Attempt to read back too far");
@@ -640,14 +800,18 @@ LogicalResult LoadOp::evaluate(Interpreter& interp,
     outs[0]->setVal(0);
     return success();
   }
-  size_t totOffset = size * (interp.getCycle() - distance) + offset;
+  size_t totOffset = size * interp.getBackCycle(distance) + offset;
   if (totOffset >= buf.size()) {
     return emitError() << "Attempting to get out of bounds index " << totOffset
                        << " from buffer of size " << buf.size();
   }
-  Interpreter::Polynomial val = buf[totOffset];
+
+  size_t refK = getRef().getType().getElement().getFieldK();
+  Interpreter::Polynomial val;
+  llvm::append_range(
+      val, llvm::map_range(buf.slice(totOffset, refK), [&](auto elem) { return elem[0]; }));
   if (isInvalid(val)) {
-    if (!getOperation()->hasAttr("unchecked")) {
+    if (interp.getTotCycles() || !getOperation()->hasAttr("unchecked")) {
 
       auto diag = emitError() << "LoadOp: Read before write " << bufName << "[" << offset << "]@"
                               << distance;
@@ -678,47 +842,64 @@ LogicalResult StoreOp::evaluate(Interpreter& interp,
     return emitError() << "Attempting to set out of bounds index " << totOffset
                        << " in buffer of size " << buf.size();
   }
-  Interpreter::Polynomial& val = buf[totOffset];
+  size_t refK = getRef().getType().getElement().getFieldK();
   Interpreter::PolynomialRef newVal = adaptor.getVal()->getVal();
-  if (!isInvalid(val) && val != newVal) {
-    return emitError() << "StoreOp: Invalid set of " << bufName << "[" << offset << "], cur=" << val
-                       << ", new = " << newVal;
+  for (size_t i = 0; i < refK; i++) {
+    Interpreter::Polynomial newElem(1);
+    if (i >= newVal.size())
+      newElem[0] = 0;
+    else
+      newElem[0] = newVal[i];
+
+    Interpreter::Polynomial& oldElem = buf[totOffset + i];
+    if (!isInvalid(oldElem) && oldElem != newElem) {
+      return emitError() << "StoreOp: Invalid set of " << bufName << "[" << offset << " + " << i
+                         << "], cur=" << oldElem << ", new = " << newVal;
+    }
+    oldElem = newElem;
   }
-  val = Interpreter::Polynomial(newVal.begin(), newVal.end());
   return success();
 }
 
 LogicalResult BindLayoutOp::evaluate(Interpreter& interp,
                                      llvm::ArrayRef<zirgen::Zll::InterpVal*> outs,
                                      EvalAdaptor& adaptor) {
-  auto glob = SymbolTable::lookupNearestSymbolFrom<GlobalConstOp>(*this, getLayoutAttr());
-  if (!glob) {
-    return emitError() << "Unable to find symbol " << getLayout() << "\n";
-  }
-
-  auto bufferName = adaptor.getBuffer()->getAttr<StringAttr>();
-  if (!bufferName)
+  auto getBufferOp = getBuffer().getDefiningOp<GetBufferOp>();
+  if (!getBufferOp)
     return emitError() << "Missing buffer";
 
-  outs[0]->setAttr(BoundLayoutAttr::get(bufferName, glob.getConstant()));
+  Attribute layoutAttr = getLayoutAttr();
+  if (auto symAttr = llvm::dyn_cast<SymbolRefAttr>(layoutAttr)) {
+    // Look up by symbol
+    auto glob = SymbolTable::lookupNearestSymbolFrom<GlobalConstOp>(*this, symAttr);
+    if (!glob) {
+      return emitError() << "Unable to find symbol " << getLayout() << "\n";
+    }
+    layoutAttr = glob.getConstant();
+  }
+
+  outs[0]->setAttr(BoundLayoutAttr::get(getBufferOp.getNameAttr(), layoutAttr));
+
   return success();
 }
 
 void BindLayoutOp::emitExpr(zirgen::codegen::CodegenEmitter& cg) {
-  auto globOp =
-      SymbolTable::lookupNearestSymbolFrom<GlobalConstOp>(*this, getLayoutAttr().getAttr());
+  auto symAttr = llvm::cast<FlatSymbolRefAttr>(getLayoutAttr());
+  auto globOp = SymbolTable::lookupNearestSymbolFrom<GlobalConstOp>(*this, symAttr);
   assert(globOp);
   cg.emitInvokeMacro(cg.getStringAttr("bind_layout"),
-                     {CodegenIdent<IdentKind::Const>(getLayoutAttr().getAttr()), getBuffer()});
+                     {CodegenIdent<IdentKind::Const>(symAttr.getAttr()), getBuffer()});
 }
 
 LogicalResult BindLayoutOp::verifySymbolUses(SymbolTableCollection& symbolTable) {
-  auto globalConstOp = symbolTable.lookupNearestSymbolFrom<GlobalConstOp>(*this, getLayoutAttr());
-  if (!globalConstOp)
-    return emitOpError() << "Cannot find global constant " << getLayoutAttr();
-  if (globalConstOp.getType() != getType())
-    return emitOpError() << "Global symbol " << getLayoutAttr() << " type "
-                         << globalConstOp.getType() << " does not match expected " << getType();
+  if (auto symAttr = llvm::dyn_cast<FlatSymbolRefAttr>(getLayoutAttr())) {
+    auto globalConstOp = symbolTable.lookupNearestSymbolFrom<GlobalConstOp>(*this, symAttr);
+    if (!globalConstOp)
+      return emitOpError() << "Cannot find global constant " << getLayoutAttr();
+    if (globalConstOp.getType() != getType())
+      return emitOpError() << "Global symbol " << getLayoutAttr() << " type "
+                           << globalConstOp.getType() << " does not match expected " << getType();
+  }
   return success();
 }
 
@@ -731,7 +912,11 @@ void GetBufferOp::emitExpr(zirgen::codegen::CodegenEmitter& cg) {
 LogicalResult GetBufferOp::evaluate(Zll::Interpreter& interp,
                                     llvm::ArrayRef<zirgen::Zll::InterpVal*> outs,
                                     EvalAdaptor& adaptor) {
-  outs[0]->setAttr(adaptor.getNameAttr());
+  // TODO: Make the semantics be the same no matter what mode we're evaluating in.
+  if (interp.hasNamedBuf(adaptor.getName()))
+    outs[0]->setBuf(interp.getNamedBuf(adaptor.getName()));
+  else
+    outs[0]->setAttr(adaptor.getNameAttr());
   return success();
 }
 
@@ -743,6 +928,18 @@ LogicalResult AliasLayoutOp::evaluate(Zll::Interpreter& interp,
   if (!deepCmp(lhs, rhs, *this)) {
     return emitError() << "AliasLayoutOp: layout guarantee not satisfied";
   }
+  return success();
+}
+
+LogicalResult LoadOp::inferReturnTypes(MLIRContext* ctx,
+                                       std::optional<Location>,
+                                       Adaptor adaptor,
+                                       llvm::SmallVectorImpl<Type>& out) {
+  auto refType = llvm::dyn_cast<RefType>(adaptor.getRef().getType());
+  if (!refType)
+    return failure();
+
+  out.push_back(refType.getElement());
   return success();
 }
 

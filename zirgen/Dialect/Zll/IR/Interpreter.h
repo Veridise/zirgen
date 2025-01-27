@@ -17,6 +17,7 @@
 #include <deque>
 #include <random>
 
+#include "mlir/IR/AsmState.h"
 #include "zirgen/Dialect/Zll/IR/IR.h"
 #include "zirgen/compiler/zkp/hash.h"
 #include "zirgen/compiler/zkp/read_iop.h"
@@ -93,10 +94,10 @@ std::vector<uint64_t> asFpArray(llvm::ArrayRef<const Zll::InterpVal*> array);
 class ExternHandler {
 public:
   virtual ~ExternHandler() {}
-  virtual std::vector<uint64_t> doExtern(llvm::StringRef name,
-                                         llvm::StringRef extra,
-                                         llvm::ArrayRef<const InterpVal*> arg,
-                                         size_t outCount);
+  virtual std::optional<std::vector<uint64_t>> doExtern(llvm::StringRef name,
+                                                        llvm::StringRef extra,
+                                                        llvm::ArrayRef<const InterpVal*> arg,
+                                                        size_t outCount);
 
   // Add input data bytes available through the readInput extern.
   void addInput(llvm::StringRef inputName, llvm::StringRef inputBytes);
@@ -139,6 +140,12 @@ public:
 
   void setCycle(size_t cycle);
   size_t getCycle();
+  void setTotCycles(size_t totCycles);
+  size_t getTotCycles();
+
+  // Calculates a wrapping (current cycle - back) modulo totCycles
+  size_t getBackCycle(size_t backDistance);
+
   const IHashSuite& getHashSuite();
   void setExternHandler(ExternHandler* handler);
   ExternHandler* getExternHandler();
@@ -147,6 +154,7 @@ public:
   // A size of 0 means a global buffer that doesn't have separate values per cycle.
   void setNamedBuf(llvm::StringRef name, BufferRef val, size_t size = 0);
   BufferRef getNamedBuf(mlir::StringRef name);
+  bool hasNamedBuf(mlir::StringRef name);
   size_t getNamedBufSize(mlir::StringRef name);
 
   void setSilenceErrors(bool silence) { silenceErrors = silence; }
@@ -267,7 +275,8 @@ private:
 
   mlir::LogicalResult evaluate(OpEvaluator* eval);
 
-  size_t cycle;
+  size_t cycle = 0;
+  size_t totCycles = 0;
   std::unique_ptr<IHashSuite> hashSuite;
   ExternHandler* handler;
   llvm::SmallVector<llvm::SmallVector<Polynomial>> allocBufs;

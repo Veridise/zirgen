@@ -28,11 +28,6 @@ def MakePolynomial : Pass<"make-polynomial", "mlir::func::FuncOp"> {
   let constructor = "zirgen::Zll::createMakePolynomialPass()";
 }
 
-def MakeVerifyTaps : Pass<"make-verify-taps", "mlir::ModuleOp"> {
-  let summary = "Generate code for verifying taps for FRI queries";
-  let constructor = "zirgen::Zll::createMakeVerifyTapsPass()";
-}
-
 def SplitStage : Pass<"split-stage", "mlir::func::FuncOp"> {
   let summary = "Split a function into one of its stages";
   let constructor = "zirgen::Zll::createSplitStagePass()";
@@ -58,6 +53,35 @@ def AddReductions : Pass<"add-reductions", "mlir::func::FuncOp"> {
   let options = [
     Option<"maxBits", "max-bits", "unsigned", /*default=*/"255", "Number of bits where outer field is still unambigous">,
   ];
+}
+
+def IfToMultiply : Pass<"if-to-multiply"> {
+  let summary = "Remove EqualZeroOp constraints from if blocks by multiplying with the condition";
+  let constructor = "zirgen::Zll::createIfToMultiplyPass()";
+}
+
+def MultiplyToIf : Pass<"multiply-to-if"> {
+  let summary = "Remove factors from EqualZeroOp constraints by moving them into `if` blocks.";
+  let constructor = "zirgen::Zll::createMultiplyToIfPass()";
+}
+
+def BalancedSplit : Pass<"balanced-split"> {
+  let summary = "Attempt to split up large blocks";
+  let constructor = "zirgen::Zll::createBalancedSplitPass()";
+  let options = [
+    Option<"maxOps", "max-ops", "unsigned", /*default=*/"5000", "Maximum number of operations in a block before splitting it">
+    ];
+}
+
+def SortForReproducibility : Pass<"sort-for-reproducibility"> {
+  let summary = "Attempt to make operation order consistent between compilers and compilations";
+  let description = [{
+     HACK: Evaluation order of arguments is unspecified in c++ and
+     different compilers do it differently. We want our circuit
+     compilations to be reproducible, so sortForReproducibility tries
+     to undo the varation in argument order.
+  }];
+  let constructor = "zirgen::Zll::createSortForReproducibilityPass()";
 }
 
 #endif // ZLL_TRANSFORM_PASSES

@@ -37,6 +37,7 @@ enum Token : int {
   tok_dot = '.',
   tok_eq = '=',
   tok_minus = '-',
+  tok_mod = '%',
   tok_paren_l = '(',
   tok_paren_r = ')',
   tok_plus = '+',
@@ -45,6 +46,7 @@ enum Token : int {
   tok_square_r = ']',
   tok_times = '*',
   tok_back = '@',
+  tok_hash = '#',
   tok_component = -1,
   tok_define = -2,
   tok_else = -3,
@@ -67,6 +69,7 @@ enum Token : int {
   tok_string_literal = -20,
   tok_variadic = -21,
   tok_global = -22,
+  tok_public = -23,
   tok_eof = 0,
 };
 

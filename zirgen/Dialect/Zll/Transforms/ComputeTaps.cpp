@@ -36,7 +36,7 @@ struct TapMap {
     if (regGroupIds.contains(ba))
       return regGroupIds.at(ba);
 
-    auto func = llvm::cast<mlir::func::FuncOp>(ba.getOwner()->getParentOp());
+    auto func = llvm::cast<mlir::FunctionOpInterface>(ba.getOwner()->getParentOp());
     auto name = func.getArgAttrOfType<StringAttr>(ba.getArgNumber(), "zirgen.argName");
     if (!name) {
       llvm::errs() << "Cannot find argument name for arg " << ba << "\n";
@@ -67,13 +67,14 @@ struct TapMap {
 struct ComputeTapsPass : public ComputeTapsBase<ComputeTapsPass> {
   void runOnOperation() override {
     auto func = getOperation();
-    auto loc = func.getLoc();
+    auto loc = func->getLoc();
     Builder builder(&getContext());
     Type valType;
 
     auto mod = func->getParentOfType<mlir::ModuleOp>();
 
-    TapMap tapMap(lookupModuleAttr<BuffersAttr>(mod));
+    BuffersAttr bufs = lookupModuleAttr<BuffersAttr>(mod);
+    TapMap tapMap(bufs);
 
     // Find taps used in circuit.
     llvm::SmallVector<TapAttr> tapAttrs;
@@ -87,7 +88,14 @@ struct ComputeTapsPass : public ComputeTapsBase<ComputeTapsPass> {
       }
     });
 
-    TapsAnalysis tapsAnalysis(&getContext(), std::move(tapAttrs));
+    // Make sure none of our three hardcoded buffers are empty.
+    for (auto i : llvm::seq(3)) {
+      tapAttrs.push_back(TapAttr::get(&getContext(), i, 0, 0));
+    }
+
+    setModuleAttr(mod, TapsAttr::sortAndPad(tapAttrs, bufs));
+
+    auto& tapsAnalysis = getAnalysis<TapsAnalysis>();
 
     // Assign back to "tap" attributes on each operation
     mod.walk([&](GetOp op) {
@@ -116,15 +124,6 @@ struct ComputeTapsPass : public ComputeTapsBase<ComputeTapsPass> {
     } else {
       emitError(loc) << "No taps found";
     }
-
-    func->setAttr("taps",
-                  builder.getArrayAttr(llvm::to_vector_of<Attribute>(tapsAnalysis.getTapAttrs())));
-    func->setAttr(
-        "tapRegs",
-        builder.getArrayAttr(llvm::to_vector_of<Attribute>(tapsAnalysis.getTapRegAttrs())));
-    func->setAttr(
-        "tapCombos",
-        builder.getArrayAttr(llvm::to_vector_of<Attribute>(tapsAnalysis.getTapCombosAttrs())));
   }
 };
 

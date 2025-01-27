@@ -14,9 +14,9 @@
 
 #include "zirgen/compiler/edsl/edsl.h"
 
+#include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
-#include "mlir/Transforms/TopologicalSortUtils.h"
 
 #include "zirgen/Dialect/ZStruct/IR/ZStruct.h"
 #include "zirgen/Dialect/Zll/Analysis/DegreeAnalysis.h"
@@ -101,7 +101,7 @@ Val::Val(llvm::ArrayRef<uint64_t> val, SourceLoc loc) {
 }
 
 Val::Val(Register reg, SourceLoc loc) {
-  if (reg.buf.getType().cast<BufferType>().getKind() == BufferKind::Global) {
+  if (cast<BufferType>(reg.buf.getType()).getKind() == BufferKind::Global) {
     value = getBuilder().create<GetGlobalOp>(toLoc(loc, reg.ident), reg.buf, 0);
   } else {
     auto getOp =
@@ -115,7 +115,7 @@ Val::Val(Register reg, SourceLoc loc) {
 }
 
 void Register::operator=(CaptureVal x) {
-  if (buf.getType().cast<BufferType>().getKind() == BufferKind::Global) {
+  if (cast<BufferType>(buf.getType()).getKind() == BufferKind::Global) {
     getBuilder().create<SetGlobalOp>(toLoc(x.loc, x.ident), buf, 0, x.getValue());
   } else {
     getBuilder().create<SetOp>(toLoc(x.loc, x.ident), buf, 0, x.getValue());
@@ -127,7 +127,7 @@ mlir::Location CaptureIdx::getLoc() {
 }
 
 Val Buffer::get(size_t idx, StringRef ident, SourceLoc loc) {
-  if (buf.getType().cast<BufferType>().getKind() == BufferKind::Global) {
+  if (cast<BufferType>(buf.getType()).getKind() == BufferKind::Global) {
     return Val(getBuilder().create<GetGlobalOp>(toLoc(loc, ident), buf, 0));
   } else {
     return Val(getBuilder().create<GetOp>(toLoc(loc, ident), buf, idx, 0, IntegerAttr()));
@@ -135,7 +135,7 @@ Val Buffer::get(size_t idx, StringRef ident, SourceLoc loc) {
 }
 
 void Buffer::set(size_t idx, Val x, StringRef ident, SourceLoc loc) {
-  if (buf.getType().cast<BufferType>().getKind() == BufferKind::Global) {
+  if (cast<BufferType>(buf.getType()).getKind() == BufferKind::Global) {
     getBuilder().create<SetGlobalOp>(toLoc(loc, ident), buf, idx, x.getValue());
   } else {
     getBuilder().create<SetOp>(toLoc(loc, ident), buf, idx, x.getValue());
@@ -143,7 +143,7 @@ void Buffer::set(size_t idx, Val x, StringRef ident, SourceLoc loc) {
 }
 
 void Buffer::setDigest(size_t idx, DigestVal x, StringRef ident, SourceLoc loc) {
-  if (buf.getType().cast<BufferType>().getKind() != BufferKind::Global) {
+  if (cast<BufferType>(buf.getType()).getKind() != BufferKind::Global) {
     throw(std::runtime_error("Currently digests can only be stored in globals"));
   }
   getBuilder().create<SetGlobalDigestOp>(toLoc(loc, ident), buf, idx, x.getValue());
@@ -154,7 +154,7 @@ Buffer Buffer::slice(size_t offset, size_t size, SourceLoc loc) {
 }
 
 Register Buffer::getRegister(size_t idx, StringRef ident, SourceLoc loc) {
-  if (idx >= buf.getType().cast<BufferType>().getSize()) {
+  if (idx >= cast<BufferType>(buf.getType()).getSize()) {
     llvm::errs() << "Out of bounds index: " << loc.filename << ":" << loc.line << "\n";
     throw std::runtime_error("OOB Index");
   }
@@ -165,8 +165,7 @@ mlir::Location CaptureVal::getLoc() {
   return toLoc(loc);
 }
 
-// TODO: Figure out why we get more crashes in CSE when threading is enabled.
-Module::Module() : ctx(MLIRContext::Threading::DISABLED), builder(&ctx) {
+Module::Module() : builder(&ctx) {
   ctx.getOrLoadDialect<ZllDialect>();
   ctx.getOrLoadDialect<Iop::IopDialect>();
   ctx.getOrLoadDialect<ZStruct::ZStructDialect>();
@@ -174,12 +173,16 @@ Module::Module() : ctx(MLIRContext::Threading::DISABLED), builder(&ctx) {
   builder.setInsertionPointToEnd(&module->getBodyRegion().front());
 }
 
-void Module::optimize(size_t stageCount) {
-  sortForReproducibility();
-  PassManager pm(module->getContext());
+void Module::addOptimizationPasses(PassManager& pm) {
   OpPassManager& opm = pm.nest<func::FuncOp>();
+  opm.addPass(createSortForReproducibilityPass());
   opm.addPass(createCanonicalizerPass());
   opm.addPass(createCSEPass());
+}
+
+void Module::optimize(size_t stageCount) {
+  PassManager pm(module->getContext());
+  addOptimizationPasses(pm);
   if (failed(pm.run(*module))) {
     throw std::runtime_error("Failed to apply basic optimization passes");
   }
@@ -243,7 +246,8 @@ size_t Module::computeMaxDegree(StringRef name) {
 
   size_t max = 0;
   moduleCopy.walk([&](func::ReturnOp op) {
-    Zll::Degree degree = solver.lookupState<DegreeLattice>(op)->getValue();
+    auto point = solver.getProgramPointAfter(op);
+    Zll::Degree degree = solver.lookupState<DegreeLattice>(point)->getValue();
     max = std::max<size_t>(max, degree.get());
   });
   if (max == 0) {
@@ -274,11 +278,13 @@ void Module::dumpPoly(StringRef name) {
 
   Block* block = &func.front();
   Operation* cur = block->getTerminator();
-  size_t degree = solver.lookupState<DegreeLattice>(cur)->getValue().get();
+  auto point = solver.getProgramPointAfter(cur);
+  size_t degree = solver.lookupState<DegreeLattice>(point)->getValue().get();
   llvm::errs() << "Degree = " << degree << "\n";
   while (true) {
+    point = solver.getProgramPointAfter(cur);
     cur->print(llvm::errs(), OpPrintingFlags().enableDebugInfo(true));
-    size_t curDeg = solver.lookupState<DegreeLattice>(cur)->getValue().get();
+    size_t curDeg = solver.lookupState<DegreeLattice>(point)->getValue().get();
     llvm::errs() << "\n";
     if (auto retOp = mlir::dyn_cast<mlir::func::ReturnOp>(cur)) {
       cur = retOp.getOperands()[0].getDefiningOp();
@@ -387,153 +393,11 @@ void Module::setPhases(mlir::func::FuncOp funcOp, llvm::ArrayRef<std::string> ph
     steps.push_back(builder.getAttr<mlir::StringAttr>(phase));
   }
   setModuleAttr(funcOp, builder.getAttr<StepsAttr>(steps));
+  setModuleAttr(funcOp, builder.getAttr<CircuitNameAttr>(funcOp.getName()));
 }
 
 void Module::setProtocolInfo(ProtocolInfo info) {
   setModuleAttr(getModule(), getBuilder().getAttr<ProtocolInfoAttr>(info));
-}
-
-void Module::sortForReproducibility() {
-  DenseMap<Operation*, std::string> propInfo;
-  DenseMap<Operation*, size_t> argPositions;
-
-  // Save some things we can use to deterministically sort operations.
-  module->walk([&](Operation* op) {
-    for (auto [i, arg] : llvm::enumerate(op->getOperands())) {
-      auto definer = arg.getDefiningOp();
-      if (definer) {
-        auto& pos = argPositions[definer];
-        pos += i;
-      }
-    }
-    std::string props = op->getName().getStringRef().str();
-    llvm::raw_string_ostream os(props);
-    op->getPropertiesAsAttribute().print(os);
-    propInfo[op] = std::move(props);
-  });
-
-  std::function<bool(Operation & a, Operation & b)> operationCompare, cachedOperationCompare;
-  operationCompare = [&](Operation& a, Operation& b) {
-    if (&a == &b)
-      return false;
-
-    const auto& aInfo = propInfo.at(&a);
-    const auto& bInfo = propInfo.at(&b);
-    if (aInfo != bInfo) {
-      return aInfo < bInfo;
-    }
-
-    size_t aPos = argPositions.lookup(&a);
-    size_t bPos = argPositions.lookup(&b);
-    if (aPos != bPos) {
-      return aPos < bPos;
-    }
-
-    if (a.getNumOperands() != b.getNumOperands()) {
-      return a.getNumOperands() < b.getNumOperands();
-    }
-
-    // If nothing else works, recursively compare operands
-    for (auto [aOperand, bOperand] : llvm::zip_equal(a.getOperands(), b.getOperands())) {
-      auto aDefiner = llvm::dyn_cast<OpResult>(aOperand);
-      auto bDefiner = llvm::dyn_cast<OpResult>(bOperand);
-      if (bool(aDefiner) != bool(bDefiner))
-        return bool(aDefiner) < bool(bDefiner);
-
-      if (aDefiner && bDefiner) {
-        if (aDefiner.getResultNumber() != bDefiner.getResultNumber())
-          return aDefiner.getResultNumber() < bDefiner.getResultNumber();
-
-        if (cachedOperationCompare(*aDefiner.getOwner(), *bDefiner.getOwner()))
-          return true;
-        if (cachedOperationCompare(*bDefiner.getOwner(), *aDefiner.getOwner()))
-          return false;
-      }
-
-      auto aArg = llvm::dyn_cast<BlockArgument>(aOperand);
-      auto bArg = llvm::dyn_cast<BlockArgument>(bOperand);
-
-      if (bool(aArg) != bool(bArg))
-        return bool(aArg) < bool(bArg);
-
-      if (aArg && bArg) {
-        if (aArg.getArgNumber() != bArg.getArgNumber())
-          return aArg.getArgNumber() < bArg.getArgNumber();
-      }
-    }
-
-    return false;
-  };
-
-  llvm::DenseMap<std::pair<Operation*, Operation*>, bool> compareResults;
-  cachedOperationCompare = [&](Operation& a, Operation& b) {
-    auto [it, didInsert] = compareResults.try_emplace(std::make_pair(&a, &b), false);
-    if (didInsert) {
-      bool lessThan = operationCompare(a, b);
-      // We can't use the original iterator since it may have been invalidated.
-      compareResults[std::make_pair(&a, &b)] = lessThan;
-      return lessThan;
-    } else {
-      return it->second;
-    }
-  };
-
-  module->walk([&](Block* inner) {
-    auto shouldSort = [&](Operation* op) {
-      if (op->hasTrait<OpTrait::IsTerminator>())
-        return false;
-      if (isPure(op))
-        return true;
-      return false;
-    };
-
-    Block doneBlock;
-
-    // Find runs of pure operations all in a row, and sort them.
-    auto it = inner->getOperations().begin();
-    while (it != inner->getOperations().end()) {
-      if (!shouldSort(&*it)) {
-        ++it;
-        continue;
-      }
-
-      // Move the section of operations we're not sorting into doneBlock.
-      doneBlock.getOperations().splice(doneBlock.getOperations().end(),
-                                       inner->getOperations(),
-                                       inner->getOperations().begin(),
-                                       it);
-      it = inner->getOperations().begin();
-
-      while (it != inner->getOperations().end() && shouldSort(&*it)) {
-        ++it;
-      }
-
-      Block sortBlock;
-      // Move the sections of operations we *are* sorting into sortBlock
-      sortBlock.getOperations().splice(sortBlock.getOperations().end(),
-                                       inner->getOperations(),
-                                       inner->getOperations().begin(),
-                                       it);
-      sortBlock.getOperations().sort(cachedOperationCompare);
-
-      // After we sort reproducibly, we have to topologically sort to make sure we don't screw up
-      // SSA dominance.
-      mlir::sortTopologically(&sortBlock);
-
-      // Append the sorted section to doneBlock.
-      doneBlock.getOperations().splice(doneBlock.getOperations().end(),
-                                       sortBlock.getOperations(),
-                                       sortBlock.getOperations().begin(),
-                                       sortBlock.getOperations().end());
-      it = inner->getOperations().begin();
-    }
-
-    // Move all the operations we've processed out from doneBlock into the original block.
-    inner->getOperations().splice(inner->getOperations().begin(),
-                                  doneBlock.getOperations(),
-                                  doneBlock.getOperations().begin(),
-                                  doneBlock.getOperations().end());
-  });
 }
 
 mlir::func::FuncOp Module::endFunc(SourceLoc loc) {
@@ -566,7 +430,7 @@ void Module::runFunc(func::FuncOp func,
   interpreter.setExternHandler(handler);
   for (size_t i = 0; i < bufs.size(); i++) {
     Value arg = func.getArgument(i);
-    auto type = arg.getType().dyn_cast<BufferType>();
+    auto type = dyn_cast<BufferType>(arg.getType());
     if (!type) {
       throw std::runtime_error("Function has non-buffer types");
     }

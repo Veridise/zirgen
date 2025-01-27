@@ -1,11 +1,11 @@
 // This code is automatically generated
 
-#include "fp.h"
-#include "fpext.h"
+#include "supra/fp.h"
+#include "supra/fpext.h"
 
 #include <cstdint>
 
-namespace risc0::circuit::recursion {
+namespace {{cppNamespace}} {
 
 constexpr size_t INV_RATE = 4;
 __constant__ FpExt poly_mix[{{num_mix_powers}}];
@@ -45,4 +45,4 @@ __global__ void eval_check(Fp* check,
   }
 }
 
-} // namespace risc0::circuit::recursion
+} {{cppNamespace}}

@@ -43,18 +43,30 @@ public:
     addMember(builder.getStringAttr(memberName), value);
   }
 
+  void addPrivateMember(StringRef memberName, Value value) {
+    addPrivateMember(builder.getStringAttr(memberName), value);
+  }
+
   void addMember(StringAttr memberName, Value value) {
     assert(value);
     assert(value.getType());
 
     if (memberName == "@super") {
       // TODO: Why do we require @super to be first?  Document this requirement.
-      members.insert(members.begin(), {memberName, value.getType()});
+      members.insert(members.begin(), {.name = memberName, .type = value.getType()});
       memberValues.insert(memberValues.begin(), value);
     } else {
-      members.push_back({memberName, value.getType()});
+      members.push_back({.name = memberName, .type = value.getType()});
       memberValues.push_back(value);
     }
+  }
+
+  void addPrivateMember(StringAttr memberName, Value value) {
+    assert(value);
+    assert(value.getType());
+    assert(memberName != "@super");
+    members.push_back({.name = memberName, .type = value.getType(), .isPrivate = true});
+    memberValues.push_back(value);
   }
 
   bool empty() const { return members.empty(); }
@@ -79,11 +91,6 @@ public:
   /// Adds a new subcomponent construction of the given name.  Returns the value of the
   /// layout lookup to pass to the subcomponent.
   mlir::Value addMember(Location loc, StringRef memberName, mlir::Type type);
-
-  /// Removes the given member name from this layout.  originalMemmber
-  /// must match the value previously returned from addMember. Caller
-  /// will need to remove any operations associated with it.
-  void removeMember(Value originalMember, StringRef memberName);
 
   void setKind(ZStruct::LayoutKind kind) { this->kind = kind; }
 
@@ -116,7 +123,7 @@ private:
 Type getLeastCommonSuper(TypeRange components, bool isLayout = false);
 
 /// True iff the super chain of src contains dst.
-bool isCoercibleTo(Type src, Type dst);
+bool isCoercibleTo(Type src, Type dst, bool isLayout = false);
 
 /// Coerces the given value to the given type. The type must be in the super
 /// chain of value.
@@ -135,12 +142,14 @@ bool isGenericBuiltin(StringRef name);
 using ZStruct::getComponentType;
 using ZStruct::getEmptyLayoutType;
 using ZStruct::getExtRefType;
+using ZStruct::getExtValType;
+using ZStruct::getNondetExtRegLayoutType;
+using ZStruct::getNondetExtRegType;
 using ZStruct::getNondetRegLayoutType;
 using ZStruct::getNondetRegType;
 using ZStruct::getRefType;
 using ZStruct::getStringType;
 using ZStruct::getTypeType;
-using ZStruct::getValExtType;
 using ZStruct::getValType;
 
 Zll::ValType getFieldTypeOfValType(Type valType);
@@ -169,8 +178,5 @@ llvm::MapVector<Type, size_t> muxArgumentCounts(TypeRange in);
 
 // Extracts the maximum number of each 'argument' type used by any arm of the mux
 llvm::MapVector<Type, size_t> muxArgumentCounts(ZStruct::LayoutType in);
-
-// Return true if the given variable name is local
-bool isLocalVariable(llvm::StringRef name);
 
 } // namespace zirgen::Zhlt

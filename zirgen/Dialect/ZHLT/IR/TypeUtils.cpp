@@ -25,7 +25,7 @@ using namespace ZStruct;
 
 bool isLegalTypeArg(Attribute attr) {
   // Would this attribute be a legal argument for a mangled component name?
-  return attr && (attr.isa<StringAttr>() || attr.isa<PolynomialAttr>());
+  return attr && (isa<StringAttr>(attr) || isa<PolynomialAttr>(attr));
 }
 
 std::string mangledTypeName(StringRef componentName, llvm::ArrayRef<Attribute> typeArgs) {
@@ -35,10 +35,12 @@ std::string mangledTypeName(StringRef componentName, llvm::ArrayRef<Attribute> t
   if (typeArgs.size() != 0) {
     stream << "<";
     llvm::interleaveComma(typeArgs, stream, [&](Attribute typeArg) {
-      if (auto strAttr = typeArg.dyn_cast<StringAttr>()) {
+      if (auto strAttr = dyn_cast<StringAttr>(typeArg)) {
         stream << strAttr.getValue();
-      } else if (auto intAttr = typeArg.dyn_cast<PolynomialAttr>()) {
+      } else if (auto intAttr = dyn_cast<PolynomialAttr>(typeArg)) {
         stream << intAttr[0];
+      } else if (auto intAttr = dyn_cast<IntegerAttr>(typeArg)) {
+        stream << intAttr.getUInt();
       } else {
         llvm::errs() << "Mangling type " << typeArg << " not implemented\n";
         assert(false && "not implemented");
@@ -114,12 +116,12 @@ Type getLeastCommonSuper(TypeRange components, bool isLayout) {
   }
 }
 
-bool isCoercibleTo(Type src, Type dst) {
+bool isCoercibleTo(Type src, Type dst, bool isLayout) {
   if (auto variadic = dyn_cast<VariadicType>(dst)) {
     dst = variadic.getElement();
   }
   while (src != dst) {
-    Type newSrc = getSuperType(src);
+    Type newSrc = getSuperType(src, isLayout);
     if (!newSrc)
       break;
     src = newSrc;
@@ -127,22 +129,23 @@ bool isCoercibleTo(Type src, Type dst) {
   if (src == dst)
     return true;
 
-  if (llvm::isa<ArrayType, LayoutArrayType>(src)) {
-
+  if (auto srcArrayType = llvm::dyn_cast<ArrayLikeTypeInterface>(src)) {
     // Attempt to coerce arrays
     while (dst) {
-      Type newDst = getSuperType(dst);
+      Type newDst = getSuperType(dst, isLayout);
       if (!newDst)
         break;
       dst = newDst;
     }
 
-    return TypeSwitch<Type, bool>(src).Case<ArrayType, LayoutArrayType>([&](auto srcArrayType) {
-      auto dstArrayType = llvm::cast<decltype(srcArrayType)>(dst);
-      if (srcArrayType.getSize() != dstArrayType.getSize())
-        return false;
-      return isCoercibleTo(srcArrayType, dstArrayType);
-    });
+    auto dstArrayType = llvm::cast<ArrayLikeTypeInterface>(dst);
+    if (srcArrayType.getSize() != dstArrayType.getSize())
+      return false;
+
+    if (llvm::isa<LayoutArrayType>(srcArrayType) || llvm::isa<ArrayType>(dstArrayType)) {
+      // Cannot construct LayoutArrays at runtime.
+      return isCoercibleTo(srcArrayType.getElement(), dstArrayType.getElement(), isLayout);
+    }
   }
 
   return false;
@@ -245,7 +248,7 @@ ArrayLikeTypeInterface getCoercibleArrayType(Type type) {
     }
     type = getSuperType(type);
   }
-  return ArrayType();
+  return ArrayLikeTypeInterface();
 }
 
 Value coerceToArray(Value value, OpBuilder& builder) {
@@ -262,6 +265,14 @@ Value coerceToArray(Value value, OpBuilder& builder) {
         emitError(loc) << "component struct must inherit from `Component`";
         return castedStruct;
       }
+    } else if (isa<LayoutType>(casted.getType())) {
+      auto castedStruct = cast<TypedValue<LayoutType>>(casted);
+      casted = coerceStructToSuper<LayoutType>(castedStruct, builder);
+      if (!casted) {
+        auto loc = value.getLoc();
+        emitError(loc) << "component struct must inherit from `Component`";
+        return castedStruct;
+      }
     } else if (UnionType ut = dyn_cast<UnionType>(casted.getType())) {
       // We require the super component to always be aligned to the beginning of
       // the component in its ultimate value representation. Because of this,the
@@ -269,7 +280,7 @@ Value coerceToArray(Value value, OpBuilder& builder) {
       // it makes no difference which arm we use to access the common super.
       // Without loss of generality, choose the first one.
       casted = builder.create<ZStruct::LookupOp>(value.getLoc(), casted, ut.getFields()[0].name);
-    } else if (isa<ArrayType>(casted.getType())) {
+    } else if (isa<ArrayLikeTypeInterface>(casted.getType())) {
       return casted;
     } else {
       // If not a structural type, supertype is Component.
@@ -304,6 +315,9 @@ mlir::Value LayoutBuilder::addMember(Location loc, StringRef memberName, mlir::T
     return Value();
 
   for (auto member : members) {
+    if (member.name == memberName) {
+      llvm::errs() << "Duplicate name: " << memberName << "\n";
+    }
     assert(member.name != memberName && "adding layout member with duplicate name");
   }
   StringAttr memberNameAttr = builder.getStringAttr(memberName);
@@ -319,13 +333,6 @@ mlir::Value LayoutBuilder::addMember(Location loc, StringRef memberName, mlir::T
   builder.setInsertionPoint(layoutPlaceholder);
   auto lookupOp = builder.create<LookupOp>(loc, type, layoutPlaceholder, memberName);
   return lookupOp;
-}
-
-void LayoutBuilder::removeMember(Value originalMember, StringRef memberName) {
-  auto originalLookup = originalMember.getDefiningOp<LookupOp>();
-  assert(originalLookup && originalLookup.getBase() == layoutPlaceholder &&
-         "expandLayoutMember attempting to expand layoutMember on different LoweringContext");
-  llvm::erase_if(members, [memberName](auto member) -> bool { return member.name == memberName; });
 }
 
 LayoutType LayoutBuilder::getType() {
@@ -357,8 +364,9 @@ void LayoutBuilder::supplyLayout(std::function<Value(Type)> finalizeLayoutFunc) 
 std::string getTypeId(Type ty) {
   return TypeSwitch<Type, std::string>(ty)
       .Case<StringType>([](auto) { return "String"; })
-      .Case<ValType>([](auto) { return "Val"; })
-      .Case<RefType>([](auto) { return "Ref"; })
+      .Case<ValType>([](auto valType) { return (valType.getFieldK() == 1) ? "Val" : "ExtVal"; })
+      .Case<RefType>(
+          [](auto refType) { return (refType.getElement().getFieldK() == 1) ? "Ref" : "ExtRef"; })
       .Case<StructType>([](auto structType) { return structType.getId(); })
       .Case<LayoutType>([](auto layoutType) { return layoutType.getId(); })
       .Case<ArrayLikeTypeInterface>([](auto arrayType) {
@@ -445,7 +453,7 @@ llvm::MapVector<Type, size_t> muxArgumentCounts(TypeRange in) {
   llvm::MapVector<Type, size_t> worstCase;
   for (auto type : in) {
     llvm::MapVector<Type, size_t> curCase;
-    Zhlt::extractArguments(curCase, type.cast<LayoutType>());
+    Zhlt::extractArguments(curCase, cast<LayoutType>(type));
     for (const auto& kvp : curCase) {
       worstCase[kvp.first] = std::max(worstCase[kvp.first], kvp.second);
     }
@@ -458,10 +466,6 @@ llvm::MapVector<Type, size_t> muxArgumentCounts(LayoutType in) {
   SmallVector<Type> layoutFields =
       llvm::to_vector(llvm::map_range(in.getFields(), [](auto field) { return field.type; }));
   return Zhlt::muxArgumentCounts(layoutFields);
-}
-
-bool isLocalVariable(llvm::StringRef name) {
-  return name.starts_with("_");
 }
 
 } // namespace zirgen::Zhlt

@@ -35,7 +35,7 @@ ValType getValType(MLIRContext* ctx) {
   return ValType::getBaseType(ctx);
 }
 
-ValType getValExtType(MLIRContext* ctx) {
+ValType getExtValType(MLIRContext* ctx) {
   return ValType::getExtensionType(ctx);
 }
 
@@ -46,7 +46,14 @@ StringType getStringType(MLIRContext* ctx) {
 StructType getNondetRegType(MLIRContext* ctx) {
   SmallVector<ZStruct::FieldInfo> members;
   members.push_back({StringAttr::get(ctx, "@super"), getValType(ctx)});
+  members.push_back({StringAttr::get(ctx, "@layout"), getNondetRegLayoutType(ctx)});
   return StructType::get(ctx, "NondetReg", members);
+}
+
+StructType getNondetExtRegType(MLIRContext* ctx) {
+  SmallVector<ZStruct::FieldInfo> members;
+  members.push_back({StringAttr::get(ctx, "@super"), getExtValType(ctx)});
+  return StructType::get(ctx, "NondetExtReg", members);
 }
 
 LayoutType getNondetRegLayoutType(MLIRContext* ctx) {
@@ -55,12 +62,18 @@ LayoutType getNondetRegLayoutType(MLIRContext* ctx) {
   return LayoutType::get(ctx, "NondetReg", members);
 }
 
+LayoutType getNondetExtRegLayoutType(MLIRContext* ctx) {
+  SmallVector<ZStruct::FieldInfo> members;
+  members.push_back({StringAttr::get(ctx, "@super"), getExtRefType(ctx)});
+  return LayoutType::get(ctx, "NondetExtReg", members);
+}
+
 RefType getRefType(MLIRContext* ctx) {
   return RefType::get(ctx, getValType(ctx));
 }
 
 RefType getExtRefType(MLIRContext* ctx) {
-  return RefType::get(ctx, getValExtType(ctx));
+  return RefType::get(ctx, getExtValType(ctx));
 }
 
 } // namespace zirgen::ZStruct

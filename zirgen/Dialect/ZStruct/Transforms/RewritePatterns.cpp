@@ -22,7 +22,7 @@ using namespace mlir;
 LogicalResult UnrollMaps::matchAndRewrite(MapOp op, PatternRewriter& rewriter) const {
   Value in = op.getArray();
   auto inType = mlir::cast<ZStruct::ArrayLikeTypeInterface>(in.getType());
-  auto outType = mlir::cast<ZStruct::ArrayLikeTypeInterface>(op.getOut().getType());
+  auto outType = mlir::cast<ZStruct::ArrayType>(op.getOut().getType());
 
   llvm::SmallVector<Value, 8> mapped;
 
@@ -50,7 +50,7 @@ LogicalResult UnrollMaps::matchAndRewrite(MapOp op, PatternRewriter& rewriter) c
     for (auto& innerOp : innerBlock.without_terminator()) {
       rewriter.clone(innerOp, mapping);
     }
-    mapped.push_back(mapping.lookup(innerReturnVal));
+    mapped.push_back(mapping.lookupOrDefault(innerReturnVal));
   }
   auto unrolled = outType.materialize(op.getLoc(), mapped, rewriter);
   rewriter.replaceOp(op, unrolled);
@@ -103,6 +103,10 @@ LogicalResult SplitSwitchArms::matchAndRewrite(SwitchOp op, PatternRewriter& rew
   rewriter.setInsertionPoint(op);
   for (auto [cond, arm] : llvm::zip(op.getSelector(), op.getArms())) {
     auto ifOp = rewriter.create<Zll::IfOp>(op.getLoc(), cond);
+    auto termOp = arm.front().getTerminator();
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(termOp);
+    rewriter.replaceOpWithNewOp<Zll::TerminateOp>(termOp);
     ifOp.getInner().takeBody(arm);
   }
   rewriter.eraseOp(op);

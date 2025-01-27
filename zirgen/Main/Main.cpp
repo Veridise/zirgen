@@ -16,6 +16,7 @@
 
 #include "mlir/Debug/CLOptionsSetup.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
+#include "mlir/IR/AsmState.h"
 #include "mlir/Transforms/Passes.h"
 #include "risc0/core/elf.h"
 #include "risc0/core/util.h"
@@ -62,10 +63,10 @@ void addAccumAndGlobalPasses(mlir::PassManager& pm) {
 }
 
 void addTypingPasses(mlir::PassManager& pm) {
+  pm.addPass(zirgen::dsl::createGenerateBackPass());
   pm.addPass(zirgen::dsl::createGenerateCheckLayoutPass());
   pm.addPass(zirgen::dsl::createGenerateLayoutPass());
   pm.addPass(zirgen::Zhlt::createStripAliasLayoutOpsPass());
-  pm.addPass(zirgen::dsl::createGenerateBackPass());
   pm.addPass(mlir::createCSEPass());
   pm.addPass(zirgen::dsl::createGenerateExecPass());
   pm.addPass(mlir::createSymbolPrivatizePass({}));
@@ -90,6 +91,7 @@ mlir::LogicalResult checkDegreeExceeded(mlir::ModuleOp module, size_t maxDegree)
       tmpMod->print(llvm::outs());
     }
   });
+
   if (degreeExceeded)
     return mlir::failure();
 

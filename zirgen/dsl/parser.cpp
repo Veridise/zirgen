@@ -34,6 +34,8 @@ BinaryOpPrecedence getPrecedence(Token token) {
     return 4;
   case tok_div:
     return 4;
+  case tok_mod:
+    return 4;
   case tok_dot:
     return 5;
   default:
@@ -54,6 +56,9 @@ Parser::buildBinaryOp(Token token, Expression::Ptr&& lhs, Expression::Ptr&& rhs,
     return make_shared<Range>(location, std::move(lhs), std::move(rhs));
   case tok_bit_and:
     desugaredName = "BitAnd";
+    break;
+  case tok_mod:
+    desugaredName = "Mod";
     break;
   case tok_plus:
     desugaredName = "Add";
@@ -83,8 +88,10 @@ Parser::buildBinaryOp(Token token, Expression::Ptr&& lhs, Expression::Ptr&& rhs,
 Module::Ptr Parser::parseModule() {
   Component::Vec components;
 
-  for (bool done = false; !done;) {
+  bool done = false;
+  while (!done) {
     switch (lexer.peekToken()) {
+    case tok_hash:
     case tok_argument:
     case tok_component:
     case tok_function:
@@ -119,7 +126,45 @@ Module::Ptr Parser::parseModule() {
   }
 }
 
+Attribute::Vec Parser::parseOptionalAttributeList() {
+  if (lexer.peekToken() != tok_hash)
+    return {};
+  lexer.takeToken();
+
+  if (!lexer.takeTokenIf(tok_square_l)) {
+    error("Expected '#[' at the beginning of an attribute list");
+    return {};
+  }
+
+  Attribute::Vec attributes;
+
+  // Handle the case where there are no attributes
+  if (lexer.takeTokenIf(tok_paren_r)) {
+    return attributes;
+  }
+
+  Token token;
+  do {
+    if (lexer.takeTokenIf(tok_ident)) {
+      auto attribute = make_shared<Attribute>(lexer.getLastLocation(), lexer.getIdentifier());
+      attributes.push_back(attribute);
+      token = lexer.takeToken();
+    } else {
+      break;
+    }
+  } while (token == tok_comma && errors.empty());
+
+  if (token != tok_square_r) {
+    error("Expected ']' at the end of an attribute list");
+    return {};
+  }
+
+  return attributes;
+}
+
 Component::Ptr Parser::parseComponent() {
+  Attribute::Vec attributes = parseOptionalAttributeList();
+
   ast::Component::Kind kind;
   switch (lexer.takeToken()) {
   case tok_argument:
@@ -134,7 +179,11 @@ Component::Ptr Parser::parseComponent() {
   case tok_extern:
     return parseExtern();
   default:
-    error("A component declaration must start with the `component` keyword");
+    if (attributes.empty()) {
+      error("A component declaration must start with the `component` keyword");
+    } else {
+      error("Attributes are only allowed on component declarations");
+    }
     return nullptr;
   }
   SMLoc location = lexer.getLastLocation();
@@ -149,8 +198,13 @@ Component::Ptr Parser::parseComponent() {
   Parameter::Vec params = parseParameters();
   Expression::Ptr body = parseBlock();
 
-  return make_shared<Component>(
-      location, kind, name, std::move(typeParams), std::move(params), std::move(body));
+  return make_shared<Component>(location,
+                                kind,
+                                name,
+                                std::move(attributes),
+                                std::move(typeParams),
+                                std::move(params),
+                                std::move(body));
 }
 
 Component::Ptr Parser::parseExtern() {
@@ -187,6 +241,7 @@ Component::Ptr Parser::parseExtern() {
   return make_shared<Component>(location,
                                 Component::Kind::Extern,
                                 name,
+                                Attribute::Vec(),
                                 std::move(typeParams),
                                 std::move(params),
                                 std::move(returnType));
@@ -206,8 +261,13 @@ Component::Ptr Parser::parseTest() {
   Expression::Ptr body = parseBlock();
   name = std::string(isFail ? "test$fail$" : "test$succ$") + name;
 
-  return make_shared<Component>(
-      location, ast::Component::Kind::Object, name, Parameter::Vec(), Parameter::Vec(), body);
+  return make_shared<Component>(location,
+                                ast::Component::Kind::Object,
+                                name,
+                                Attribute::Vec(),
+                                Parameter::Vec(),
+                                Parameter::Vec(),
+                                body);
 }
 
 Block::Ptr Parser::parseBlock() {
@@ -223,14 +283,19 @@ Block::Ptr Parser::parseBlock() {
   while (!done) {
     Token token = lexer.peekToken();
     SMLoc location = lexer.getLastLocation();
-    bool globalTokenPending = false;
+    Access upcomingAccess = Access::Default;
     switch (token) {
     case tok_curly_r:
       done = true;
       break;
     case tok_global:
+    case tok_public:
       lexer.takeToken();
-      globalTokenPending = true;
+      if (token == tok_global) {
+        upcomingAccess = Access::Global;
+      } else {
+        upcomingAccess = Access::Public;
+      }
       // Fallthrough
     default:
       // definition, declaration, constraint, void, or value
@@ -278,8 +343,8 @@ Block::Ptr Parser::parseBlock() {
           return nullptr;
         }
         body.push_back(
-            make_shared<Definition>(location, identifier, std::move(defBody), globalTokenPending));
-        globalTokenPending = false;
+            make_shared<Definition>(location, identifier, std::move(defBody), upcomingAccess));
+        upcomingAccess = Access::Default;
         lastExpression = nullptr;
       } else if (lexer.peekToken() == tok_eq) {
         // constraint
@@ -308,17 +373,23 @@ Block::Ptr Parser::parseBlock() {
           error("expected semicolon after member declaration");
           return nullptr;
         }
-        body.push_back(make_shared<Declaration>(
-            location, identifier, std::move(declType), globalTokenPending));
-        globalTokenPending = false;
+        body.push_back(
+            make_shared<Declaration>(location, identifier, std::move(declType), upcomingAccess));
+        upcomingAccess = Access::Default;
         lastExpression = nullptr;
       } else if (lexer.peekToken() != tok_curly_r) {
         error("invalid statement");
         return nullptr;
       }
-      if (globalTokenPending) {
+      switch (upcomingAccess) {
+      case Access::Global:
         error("Expected declaration or definition after `global'");
         return nullptr;
+      case Access::Public:
+        error("Expected declaration or definition after `public'");
+        return nullptr;
+      case Access::Default:
+        break;
       }
       break;
     }
@@ -484,6 +555,7 @@ Expression::Ptr Parser::parseExpression(BinaryOpPrecedence precedence) {
     case tok_plus:
     case tok_times:
     case tok_div:
+    case tok_mod:
       if (!leftExpr) {
         error("missing left operand for binary operator");
       }

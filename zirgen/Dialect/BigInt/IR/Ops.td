@@ -30,6 +30,19 @@ def DefOp : BigIntOp<"def", [InferTypeOpAdaptor, DeclareOpInterfaceMethods<Codeg
   let assemblyFormat = [{ $bitWidth `,` $label `,` $isPublic `->` type($out) attr-dict }];
 }
 
+def LoadOp : BigIntOp<"load", [InferTypeOpAdaptor]> {
+  let summary = "Load a value";
+  let arguments = (ins UI32Attr:$bitWidth, UI32Attr:$arena, UI32Attr:$offset, DefaultValuedAttr<UI32Attr, "0">:$minBits);
+  let results = (outs BigInt:$out);
+  let assemblyFormat = [{ $bitWidth `,` $arena `,` $offset `->` type($out) attr-dict }];
+}
+
+def StoreOp : BigIntOp<"store", []> {
+  let summary = "Load a value";
+  let arguments = (ins BigInt:$in, UI32Attr:$arena, UI32Attr:$offset);
+  let assemblyFormat = [{ $in `,` $arena `,` $offset `:` type($in) attr-dict }];
+}
+
 def ConstOp : BigIntOp<"const", [Pure, ConstantLike, InferTypeOpAdaptor, CodegenNeverInlineOp, DeclareOpInterfaceMethods<CodegenExprOpInterface>]> {
   let summary = "Introduce a numeric constant";
   let arguments = (ins APIntAttr:$value);
@@ -50,8 +63,8 @@ def SubOp : BinaryOp<"sub", [Pure, DeclareOpInterfaceMethods<CodegenExprOpInterf
 def MulOp : BinaryOp<"mul", [Pure, Commutative, DeclareOpInterfaceMethods<CodegenExprOpInterface>]> {}
 def NondetRemOp : BinaryOp<"nondet_rem", [DeclareOpInterfaceMethods<CodegenExprOpInterface>]> {}
 def NondetQuotOp : BinaryOp<"nondet_quot", [DeclareOpInterfaceMethods<CodegenExprOpInterface>]> {}
-def NondetInvModOp : BinaryOp<"nondet_invmod", [DeclareOpInterfaceMethods<CodegenExprOpInterface>]> {}
-def ModularInvOp : BinaryOp<"inv", []> {}
+def NondetInvOp : BinaryOp<"nondet_inv", [DeclareOpInterfaceMethods<CodegenExprOpInterface>]> {}
+def InvOp : BinaryOp<"inv", []> {}
 def ReduceOp : BinaryOp<"reduce", []> {}
 
 def EqualZeroOp : BigIntOp<"eqz", [DeclareOpInterfaceMethods<CodegenExprOpInterface>]> {

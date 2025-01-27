@@ -92,7 +92,7 @@ class Buffer {
 
 public:
   Buffer(mlir::Value buf) : buf(buf) {}
-  size_t size() { return buf.getType().cast<Zll::BufferType>().getSize(); }
+  size_t size() { return mlir::cast<Zll::BufferType>(buf.getType()).getSize(); }
   Val get(size_t idx, llvm::StringRef ident, SourceLoc loc = current());
   void set(size_t idx, Val x, llvm::StringRef ident, SourceLoc loc = current());
   void setDigest(size_t idx, DigestVal x, llvm::StringRef ident, SourceLoc loc = current());
@@ -200,12 +200,8 @@ public:
     }
     return f;
   }
-  // HACK: Evaluation order of arguments is unspecified in c++ and
-  // different compilers do it differently. We want our circuit
-  // compilations to be reproducible, so sortForReproducibility tries
-  // to undo the varation in argument order.
-  void sortForReproducibility();
 
+  void addOptimizationPasses(mlir::PassManager& pm);
   void optimize(size_t stageCount = 0);
   void setExternHandler(Zll::ExternHandler* handler);
   void runFunc(llvm::StringRef name,
@@ -340,6 +336,13 @@ public:
 
 private:
   mlir::Value value;
+};
+
+// Pretend the DigestVal is a plain old Val to pass it to the extern.
+// TODO: This seems kludgy; do we want to convert the log vector to a vector of mlir::Value instead
+// of Val?
+template <> struct LogPrep<DigestVal> {
+  static void toLogVec(std::vector<Val>& out, DigestVal x) { out.push_back(Val(x.getValue())); }
 };
 
 DigestVal hash(llvm::ArrayRef<Val> inputs, bool flip = false, SourceLoc loc = current());

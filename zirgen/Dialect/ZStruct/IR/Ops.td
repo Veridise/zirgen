@@ -29,16 +29,18 @@ class ZStructOp<string mnemonic, list<Trait> traits = []>
 def LookupOp : ZStructOp<"lookup", [Pure,
                                     InferTypeOpAdaptor,
                                     DeclareOpInterfaceMethods<CodegenExprOpInterface>,
-                                    DeclareOpInterfaceMethods<PolyOp>]> {
+                                    DeclareOpInterfaceMethods<PolyOp>,
+                                    CodegenAlwaysInlineOp]> {
   let summary = "Look up reference to struct or union member";
   let assemblyFormat = [{ $base `[` $member `]` `:` functional-type($base, $out) attr-dict }];
   let arguments = (ins AnyTypeOf<[StructType,LayoutType,UnionType]>:$base, StrAttr:$member);
   let results = (outs ZirType:$out);
   let hasVerifier = 1;
   let hasFolder = 1;
+  let hasCanonicalizer = 1;
 }
 
-def SubscriptOp : ZStructOp<"subscript", [Pure,
+def SubscriptOp : ZStructOp<"subscript", [NoMemoryEffect, // but not speculatable, sicne the index might not be in range.
                                           InferTypeOpAdaptor,
                                           DeclareOpInterfaceMethods<CodegenExprOpInterface>,
                                           CodegenAlwaysInlineOp,
@@ -55,12 +57,14 @@ def SubscriptOp : ZStructOp<"subscript", [Pure,
     size_t getIndexUpperBound();
   }];
   let hasFolder = 1;
+  let hasCanonicalizer = 1;
 }
 
 def LoadOp : ZStructOp<"load", [EvalOpAdaptor,
                                 MemoryEffects<[MemRead]>,
                                 DeclareOpInterfaceMethods<CodegenExprOpInterface>,
                                 CodegenAlwaysInlineOp,
+                                InferTypeOpAdaptor,
                                 DeclareOpInterfaceMethods<PolyOp>]> {
   let summary = "Load value from a Ref";
   let description = [{
@@ -73,6 +77,7 @@ def LoadOp : ZStructOp<"load", [EvalOpAdaptor,
   let arguments = (ins Ref:$ref, Index:$distance);
   let results = (outs Val:$out);
   let hasVerifier = 1;
+  let hasCanonicalizer = 1;
 }
 
 def StoreOp : ZStructOp<"store", [EvalOpAdaptor, MemoryEffects<[MemWrite]>, DeclareOpInterfaceMethods<CodegenExprOpInterface>]> {
@@ -82,6 +87,7 @@ def StoreOp : ZStructOp<"store", [EvalOpAdaptor, MemoryEffects<[MemWrite]>, Decl
   }];
   let arguments = (ins Ref:$ref, Val:$val);
   let hasVerifier = 1;
+  let hasCanonicalizer = 1;
 }
 
 def PackOp : ZStructOp<"pack", [Pure, DeclareOpInterfaceMethods<CodegenExprOpInterface>]> {
@@ -131,20 +137,10 @@ def ArrayOp: ZStructOp<"array", [Pure, SameTypeOperands, InferTypeOpAdaptor, Dec
   let hasFolder = 1;
 }
 
-def LayoutArrayOp: ZStructOp<"layout_array", [Pure, SameTypeOperands, InferTypeOpAdaptor, DeclareOpInterfaceMethods<CodegenExprOpInterface>]> {
-  let summary = "Create an array from a list of values";
-  let arguments = (ins Variadic<IsLayoutType>:$elements);
-  let results = (outs LayoutArrayType:$out);
-  let assemblyFormat = [{
-    `[` $elements `:` type($elements) `]` attr-dict
-  }];
-  let hasFolder = 1;
-}
-
 def MapOp : ZStructOp<"map", [DeclareOpInterfaceMethods<CodegenExprOpInterface>]> {
   let summary = "Apply function to elements of array";
   let arguments = (ins ArrayLikeTypeInterface:$array, Optional<LayoutArrayType>:$layout);
-  let results = (outs ArrayLikeTypeInterface:$out);
+  let results = (outs ArrayType:$out);
   let regions = (region SizedRegion<1>:$body);
   let assemblyFormat = [{
     $array `:` type($array) ( `,` $layout^  `:` type($layout) )? `->` type($out) $body attr-dict
@@ -198,9 +194,9 @@ def BindLayoutOp : ZStructOp<"bind_layout", [
     to the registers contained therein.
   }];
   let arguments = (ins
-      FlatSymbolRefAttr:$layout,
+      AnyAttrOf<[FlatSymbolRefAttr,StructAttr,RefAttr,ArrayAttr]>:$layout,
       Buffer:$buffer);
-  let assemblyFormat = [{ $layout `:` type($out) `=` $buffer `:` type($buffer) attr-dict }];
+  let assemblyFormat = [{ $layout `->` type($out) `=` $buffer `:` type($buffer) attr-dict }];
   let results = (outs IsLayoutType:$out);
   let builders = [
       OpBuilder<

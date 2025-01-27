@@ -112,6 +112,15 @@ protected:
 
 bool operator==(const Statement& left, const Statement& right);
 
+class Attribute : public Node<Attribute> {
+  std::string name;
+
+public:
+  Attribute(SMLoc, StringRef name);
+  StringRef getName() const { return name; }
+  void print(llvm::raw_ostream&) const override;
+};
+
 class Parameter : public Node<Parameter> {
   std::string name;
   Expression::Ptr type;
@@ -140,6 +149,7 @@ public:
 private:
   const Kind kind;
   std::string name;
+  Attribute::Vec attributes;
   Parameter::Vec type_params;
   Parameter::Vec params;
   Expression::Ptr body;
@@ -148,11 +158,13 @@ public:
   Component(SMLoc loc,
             Kind kind,
             StringRef name,
+            Attribute::Vec attributes,
             Parameter::Vec type_params,
             Parameter::Vec params,
             Expression::Ptr body);
   Kind getKind() const { return kind; }
   StringRef getName() const { return name; }
+  Attribute::ArrayRef getAttributes() const { return attributes; }
   Parameter::ArrayRef getTypeParams() const { return type_params; }
   Parameter::ArrayRef getParams() const { return params; }
   Expression* getBody() const { return body.get(); }
@@ -367,17 +379,23 @@ public:
 
 bool operator==(const ArrayLiteral& left, const ArrayLiteral& right);
 
+enum class Access {
+  Default,
+  Global,
+  Public,
+};
+
 // Concrete statement nodes
 class Definition : public Statement {
   std::string name;
   Expression::Ptr value;
-  bool isGlobal;
+  Access access;
 
 public:
-  Definition(SMLoc loc, StringRef name, Expression::Ptr value, bool isGlobal);
+  Definition(SMLoc loc, StringRef name, Expression::Ptr value, Access access);
   StringRef getName() const { return name; }
   Expression* getValue() const { return value.get(); }
-  bool getIsGlobal() const { return isGlobal; }
+  Access getAccess() const { return access; }
   void print(llvm::raw_ostream&) const override;
   static bool classof(const Statement* s);
 };
@@ -387,13 +405,13 @@ bool operator==(const Definition& left, const Definition& right);
 class Declaration : public Statement {
   std::string name;
   Expression::Ptr type;
-  bool isGlobal;
+  Access access;
 
 public:
-  Declaration(SMLoc loc, StringRef name, Expression::Ptr type, bool isGlobal);
+  Declaration(SMLoc loc, StringRef name, Expression::Ptr type, Access access);
   StringRef getName() const { return name; }
   Expression* getType() const { return type.get(); }
-  bool getIsGlobal() const { return isGlobal; }
+  Access getAccess() const { return access; }
   void print(llvm::raw_ostream&) const override;
   static bool classof(const Statement* s);
 };
